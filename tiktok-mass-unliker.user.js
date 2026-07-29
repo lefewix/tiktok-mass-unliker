@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         TikTok Mass Unliker
 // @namespace    flxtcg.tools
-// @version      1.7.0
-// @description  Gradually unlikes videos while browsing your Liked feed. Paced clicking, verified clicks, session caps, dry run, target count, and a start/stop panel.
+// @version      1.8.0
+// @description  Gradually unlikes videos while browsing your Liked feed. Paced clicking, windowed click verification, container-scoped selectors, session caps, dry run, target count, and a start/stop panel.
 // @author       Felix Wang
 // @license      MIT
 // @match        https://www.tiktok.com/*
@@ -26,8 +26,23 @@
     clickJitterMs: 400,       // random pause between "seeing" and clicking
     verifyMinMs: 300,         // wait before re-reading the like state after a click
     verifyMaxMs: 500,
-    strikes: 3,               // consecutive failures before auto-pausing
+    strikes: 3,               // consecutive "no like button" failures before pausing
+
+    // Failure tracking is WINDOWED, not consecutive-only: an alternating
+    // good/bad pattern resets a consecutive counter forever, so a rolling
+    // failure rate is what actually bounds the damage. The consecutive trip
+    // is kept as a fast path for the obvious case.
+    verifyWindow: 10,         // remember the last N click verifications
+    verifyWindowFails: 3,     //   pause at this many failures inside the window
+    verifyConsecutive: 2,     //   fast path: this many in a row still-liked
+    navWindow: 10,            // remember the last N navigation attempts
+    navWindowFails: 3,        //   pause at this many failures inside the window
+    navConsecutive: 3,        //   fast path: this many failed advances in a row
+
     sessionIdleMs: 6 * 3600000, // persisted session window expires after 6h idle
+    resumeBackoffMs: 30000,   // first backoff after a repeated same-reason pause
+    resumeBackoffMaxMs: 5 * 60000,
+    resumeGiveUpAfter: 5,     // refuse to resume after this many identical pauses
   };
 
   // ---------------- Storage ----------------
@@ -72,13 +87,47 @@
   let session = 1;     // current session number
   let sessionCap = 0;  // rolled per cap window
 
-  let stuck = 0;       // consecutive navigation failures
   let missing = 0;     // consecutive "no like button" failures
-  let unflipped = 0;   // consecutive clicks that did not flip the state
   let loopPromise = null;
   let mode = 'idle';   // idle | running | break | paused | done
 
+  let lastActivity = Date.now(); // only real work refreshes the session clock
+  let lastPauseReason = '';
+  let repeatPauses = 0;
+  let resumeBackoffMs = 0;
+
   const rand = (min, max) => Math.floor(min + Math.random() * (max - min));
+
+  // ---------------- Windowed failure tracker ----------------
+  // Keeps the last `size` outcomes plus a consecutive-failure count. Tripping
+  // on EITHER a consecutive run or a failure rate inside the window means an
+  // alternating success/failure pattern can no longer run forever.
+  function tracker(size, windowFails, consecutiveFails) {
+    return { size, windowFails, consecutiveFails, hist: [], streak: 0 };
+  }
+
+  function record(t, ok) {
+    t.hist.push(!!ok);
+    if (t.hist.length > t.size) t.hist.shift();
+    t.streak = ok ? 0 : t.streak + 1;
+    return t;
+  }
+
+  const failCount = (t) => t.hist.reduce((n, ok) => n + (ok ? 0 : 1), 0);
+  const streakTripped = (t) => t.streak >= t.consecutiveFails;
+  const windowTripped = (t) => failCount(t) >= t.windowFails;
+  const clearTracker = (t) => { t.hist.length = 0; t.streak = 0; };
+
+  // verify: did the click actually flip the video to unliked?
+  const verifyTrk = tracker(CFG.verifyWindow, CFG.verifyWindowFails, CFG.verifyConsecutive);
+  // nav: did the URL actually change after clicking next?
+  const navTrk = tracker(CFG.navWindow, CFG.navWindowFails, CFG.navConsecutive);
+
+  function clearStrikes() {
+    missing = 0;
+    clearTracker(verifyTrk);
+    clearTracker(navTrk);
+  }
 
   // ---------------- Abortable sleep ----------------
   // stop()/pause() resolve the pending sleep instead of abandoning it, so the
@@ -114,19 +163,23 @@
   }
 
   // ---------------- Persistence ----------------
-  function save() {
+  // `activity` = this save follows real work (a video processed, a window
+  // rolled, a run started). Idle saves — toggling dry run, editing the target —
+  // must NOT push `at` forward, or the 6h session window never expires.
+  function save(activity) {
+    if (activity) lastActivity = Date.now();
     writeStore({
       total,
       target,
       dryRun,
-      dryTotal,
       session: {
         unliked,
         processed,
         cap: sessionCap,
         runTotal,
+        dryTotal,
         num: session,
-        at: Date.now(),
+        at: lastActivity,
       },
     });
   }
@@ -136,15 +189,42 @@
     total = Number(s.total) || 0;
     target = Number(s.target) || 0;
     dryRun = !!s.dryRun;
-    dryTotal = Number(s.dryTotal) || 0;
     const sess = s.session;
-    if (sess && Date.now() - (Number(sess.at) || 0) < CFG.sessionIdleMs) {
+    const at = sess ? Number(sess.at) || 0 : 0;
+    if (sess && Date.now() - at < CFG.sessionIdleMs) {
       unliked = Number(sess.unliked) || 0;
       processed = Number(sess.processed) || 0;
       sessionCap = Number(sess.cap) || 0;
       runTotal = Number(sess.runTotal) || 0;
       session = Number(sess.num) || 1;
+      // dryTotal lives behind the SAME expiry as runTotal — otherwise a dry run
+      // that hit its target insta-"finishes" days later with nothing processed.
+      dryTotal = Number(sess.dryTotal ?? s.dryTotal) || 0;
+      lastActivity = at;
+    } else {
+      lastActivity = Date.now();
     }
+  }
+
+  // Visible escape hatch: clears the session/run/dry counters (lifetime total
+  // is kept) and any paused state, so a stale target can never wedge the script.
+  function resetCounters() {
+    stop();
+    unliked = 0;
+    processed = 0;
+    runTotal = 0;
+    dryTotal = 0;
+    sessionCap = 0;
+    session = 1;
+    lastPauseReason = '';
+    repeatPauses = 0;
+    resumeBackoffMs = 0;
+    clearStrikes();
+    mode = 'idle';
+    lastActivity = Date.now();
+    save(true);
+    log('Counters reset. Lifetime total kept.');
+    updateUI();
   }
 
   // ---------------- Like button detection ----------------
@@ -167,21 +247,21 @@
   }
 
   // TikTok's DOM shifts often; try several strategies, most specific first.
+  // No container => no button. There is deliberately NO document-wide fallback:
+  // searching the whole page would let the script act on some other video (or
+  // another page entirely) instead of failing safe into the 3-strike pause.
   function findLikeButton() {
     const root = activeContainer();
-    const scope = root || document;
+    if (!root) return null;
     for (const sel of [
       'span[data-e2e="browse-like-icon"]',   // desktop video viewer
       'span[data-e2e="like-icon"]',          // feed layout
     ]) {
-      const el = scope.querySelector(sel);
+      const el = root.querySelector(sel);
       if (el) return el.closest('button') || el;
     }
-    // aria fallback only inside a known container — never document-wide.
-    if (root) {
-      const el = root.querySelector('button[aria-label*="Like" i]');
-      if (el) return el;
-    }
+    const el = root.querySelector('button[aria-label*="Like" i]');
+    if (el) return el;
     return null;
   }
 
@@ -220,23 +300,36 @@
   // Find TikTok's "next video" chevron and click it.
   // Synthetic ArrowDown keydowns are ignored (isTrusted check), but
   // clicking the real button element works.
+  // Anything destructive or share-y that must never be mistaken for "next".
+  // A substring match on "down" used to hit "Download this video".
+  const NEXT_DENY_RE =
+    /download|share|save|report|copy|embed|bookmark|favorit|collect|comment|follow|block|delete|mute|volume|speed|screen|repost|duet|stitch|profile|search|upload/i;
+  // Precise next / arrow-down semantics. Word-bounded, so "Download" cannot
+  // match "down" and "nextdoor"-style labels cannot match "next".
+  const NEXT_ALLOW_RE =
+    /(^|[^a-z])(next(\s+(video|item|post|clip))?|go\s+to\s+next[a-z\s]*|scroll\s+down|swipe\s+down|arrow[\s-]?down|down\s+arrow|chevron\s+down)([^a-z]|$)/i;
+
+  const labelOf = (el) =>
+    (el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+
   function findNextButton() {
-    const scope = activeContainer() || document;
-    const selectors = [
+    const scope = activeContainer();
+    if (!scope) return null;   // fail safe — never scan the whole document
+    // Most specific: TikTok's own hooks. Still deny-checked in case the hook
+    // is reused on a control that does something else.
+    for (const sel of [
       'button[data-e2e="arrow-right"]',
       'button[data-e2e="browse-video-next"]',
-      'button[aria-label*="next" i]',
-      'button[aria-label*="scroll down" i]',
-    ];
-    for (const sel of selectors) {
+    ]) {
       const el = scope.querySelector(sel);
-      if (el && !el.disabled) return el;
+      if (el && !el.disabled && !NEXT_DENY_RE.test(labelOf(el))) return el;
     }
-    // Heuristic fallback: a button whose label points downward (the ˅ chevron).
-    const candidates = [...scope.querySelectorAll('button')];
-    for (const b of candidates) {
-      const label = (b.getAttribute('aria-label') || '').toLowerCase();
-      if (label.includes('down') || label.includes('next')) return b;
+    for (const b of scope.querySelectorAll('button')) {
+      if (b.disabled) continue;
+      const label = labelOf(b);
+      if (!label) continue;
+      if (NEXT_DENY_RE.test(label)) continue;
+      if (NEXT_ALLOW_RE.test(label)) return b;
     }
     return null;
   }
@@ -264,12 +357,27 @@
   }
 
   // ---------------- Main loop ----------------
+  const targetReached = () =>
+    target > 0 && (dryRun ? dryTotal : runTotal) >= target;
+
   async function loop() {
+    // Escalating cooldown after repeated identical pauses (set by resume()).
+    if (resumeBackoffMs) {
+      const b = resumeBackoffMs;
+      resumeBackoffMs = 0;
+      mode = 'break';
+      updateUI();
+      await countdownSleep(b, (s) => `Backoff ${s}s — repeated pause, retrying slowly.`);
+      if (!running || paused) return;
+      mode = 'running';
+      updateUI();
+    }
+
     while (running && !paused) {
       try {
         // --- target reached? ---
         const done = dryRun ? dryTotal : runTotal;
-        if (target > 0 && done >= target) {
+        if (targetReached()) {
           finish(`Target reached — ${done} ${dryRun ? 'would-be ' : ''}unlikes. Stopped.`);
           return;
         }
@@ -287,7 +395,7 @@
           mode = 'break';
           log(`Break — ${why}.`);
           updateUI();
-          save();
+          save(true);
           const b = rand(CFG.sessionBreakMinMs, CFG.sessionBreakMaxMs);
           await countdownSleep(b, (s) =>
             `Break — ${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`);
@@ -326,21 +434,28 @@
             await sleep(rand(CFG.verifyMinMs, CFG.verifyMaxMs));
             if (!running || paused) return;
             const after = readLikeStateAgain(btn);
+            record(verifyTrk, after === false);
             if (after === false) {
-              unflipped = 0;
               unliked++;
               runTotal++;
               total++;
               log(`Unliked #${total}`);
-            } else if (after === true) {
-              unflipped++;
-              log(`Warning: click did not unlike (${unflipped}/2) — not counted.`);
-              if (unflipped >= 2) {
-                pause('Two clicks in a row left the video liked — stopping before we like something by mistake.');
+            } else {
+              const fails = failCount(verifyTrk);
+              log(after === true
+                ? `Warning: click did not unlike (${verifyTrk.streak} in a row, ${fails}/${CFG.verifyWindow} recent) — not counted.`
+                : `Warning: could not verify the click (${fails}/${CFG.verifyWindow} recent) — not counted.`);
+              // Consecutive run is the fast path; the windowed rate is what
+              // catches an alternating misdetect pattern, which would otherwise
+              // re-LIKE videos forever while resetting a consecutive counter.
+              if (streakTripped(verifyTrk)) {
+                pause(`${CFG.verifyConsecutive} clicks in a row left the video liked — stopping before we like something by mistake.`);
                 return;
               }
-            } else {
-              log('Warning: could not verify the click — not counted.');
+              if (windowTripped(verifyTrk)) {
+                pause(`${fails} of the last ${verifyTrk.hist.length} clicks failed to verify — stopping before we like something by mistake.`);
+                return;
+              }
             }
           }
         } else if (liked === false) {
@@ -348,21 +463,32 @@
         } else {
           log('Could not determine like state — skipping to be safe.');
         }
-        save();
+        save(true);
         updateUI();
+
+        // --- target reached? check BEFORE navigating, so hitting the target
+        //     doesn't cost one extra page load. ---
+        if (targetReached()) {
+          const n = dryRun ? dryTotal : runTotal;
+          finish(`Target reached — ${n} ${dryRun ? 'would-be ' : ''}unlikes. Stopped.`);
+          return;
+        }
 
         // --- advance ---
         const advanced = await nextVideo();
         if (!running || paused) return;
+        record(navTrk, advanced);
         if (!advanced) {
-          stuck++;
-          log(`Couldn't advance to next video (${stuck}/${CFG.strikes})…`);
-          if (stuck >= CFG.strikes) {
+          const fails = failCount(navTrk);
+          log(`Couldn't advance to next video (${navTrk.streak} in a row, ${fails}/${CFG.navWindow} recent)…`);
+          if (streakTripped(navTrk)) {
             pause('Stuck on the same video — end of feed, or the next button moved.');
             return;
           }
-        } else {
-          stuck = 0;
+          if (windowTripped(navTrk)) {
+            pause(`Navigation failed ${fails} of the last ${navTrk.hist.length} times — end of feed, or the next button moved.`);
+            return;
+          }
         }
         await sleep(rand(CFG.delayMinMs, CFG.delayMaxMs));
       } catch (err) {
@@ -378,16 +504,14 @@
     sessionCap = rand(CFG.sessionCapMin, CFG.sessionCapMax + 1);
     mode = 'running';
     if (announce) log(`Session ${session} started — cap: ${sessionCap}`);
-    save();
+    save(true);
     updateUI();
   }
 
   // ---------------- Start / stop / pause ----------------
   function start() {
     if (running) return;
-    stuck = 0;
-    missing = 0;
-    unflipped = 0;
+    clearStrikes();
     paused = false;
     pauseReason = '';
     running = true;
@@ -396,7 +520,7 @@
       sessionCap = rand(CFG.sessionCapMin, CFG.sessionCapMax + 1);
     }
     log(`Session ${session} — cap: ${sessionCap}, ${unliked} done. Keep this tab focused.`);
-    save();
+    save(true);
     updateUI();
     loopPromise = loop();
     return loopPromise;
@@ -406,10 +530,11 @@
     running = false;
     paused = false;
     pauseReason = '';
+    resumeBackoffMs = 0;
     mode = 'idle';
     abortSleep();
     if (msg) log(msg);
-    save();
+    save(false);
     updateUI();
   }
 
@@ -420,7 +545,7 @@
     mode = 'done';
     abortSleep();
     log(msg);
-    save();
+    save(false);
     updateUI();
   }
 
@@ -430,29 +555,44 @@
     paused = true;
     pauseReason = reason;
     mode = 'paused';
+    if (reason === lastPauseReason) repeatPauses++;
+    else { lastPauseReason = reason; repeatPauses = 1; }
     abortSleep();
-    log(`Paused: ${reason}`);
-    save();
+    log(repeatPauses > 1
+      ? `Paused (${repeatPauses}× for this reason): ${reason}`
+      : `Paused: ${reason}`);
+    save(false);
     updateUI();
   }
 
+  // Resume no longer wipes the slate for free: repeating the same pause earns
+  // an escalating cooldown, then a refusal, so it can't be clicked in a loop
+  // past a real problem.
   function resume() {
     if (!paused) return;
-    stuck = 0;
-    missing = 0;
-    unflipped = 0;
+    if (repeatPauses >= CFG.resumeGiveUpAfter) {
+      log(`Paused ${repeatPauses}× for the same reason — resuming won't help. Fix the page, or reset counters.`);
+      return;
+    }
+    resumeBackoffMs = repeatPauses >= 2
+      ? Math.min(CFG.resumeBackoffMs * 2 ** (repeatPauses - 2), CFG.resumeBackoffMaxMs)
+      : 0;
+    if (resumeBackoffMs) {
+      log(`Paused ${repeatPauses}× for the same reason — waiting ${Math.round(resumeBackoffMs / 1000)}s before retrying.`);
+    }
+    clearStrikes();
     return start();
   }
 
   function setDryRun(on) {
     dryRun = !!on;
-    save();
+    save(false);   // idle toggle: must not extend the session window
     updateUI();
   }
 
   function setTarget(n) {
     target = Math.max(0, Number(n) || 0);
-    save();
+    save(false);   // idle edit: must not extend the session window
     updateUI();
   }
 
@@ -571,14 +711,15 @@
       }
       #ttmu-panel button:active { transform: translateY(1px); }
       #ttmu-panel button:focus-visible { outline: 2px solid var(--ttmu-ac); outline-offset: 2px; }
-      #ttmu-panel button.running {
+      /* Secondary: only one solid-accent primary is ever visible at a time. */
+      #ttmu-panel button.secondary {
         background: var(--ttmu-surface3); border-color: var(--ttmu-b1); color: var(--ttmu-m1);
       }
-      #ttmu-panel button.running:hover {
+      #ttmu-panel button.secondary:hover {
         border-color: var(--ttmu-hairh); color: var(--ttmu-txt);
         background: #1a1922;
       }
-      #ttmu-panel #ttmu-resume { margin-top: 6px; }
+      #ttmu-panel #ttmu-reset { margin-top: 6px; padding: 6px 0; font-size: 11.5px; }
       #ttmu-log {
         margin-top: 10px; padding-top: 10px;
         border-top: 1px solid var(--ttmu-hair);
@@ -602,8 +743,9 @@
       <label for="ttmu-target">Stop after</label>
       <input type="number" id="ttmu-target" min="0" step="10" placeholder="0">
     </div>
-    <button id="ttmu-btn">Start</button>
     <button id="ttmu-resume" class="hidden">Resume</button>
+    <button id="ttmu-btn">Start</button>
+    <button id="ttmu-reset" class="secondary">Reset counters</button>
     <div id="ttmu-log">Open a video in your Liked tab first.</div>
   `;
   document.body.appendChild(panel);
@@ -617,6 +759,7 @@
     else start();
   });
   $('#ttmu-resume').addEventListener('click', () => resume());
+  $('#ttmu-reset').addEventListener('click', () => resetCounters());
   $('#ttmu-dry').addEventListener('change', (e) => setDryRun(e.target.checked));
   $('#ttmu-target').addEventListener('change', (e) => setTarget(e.target.value));
 
@@ -634,11 +777,19 @@
 
     $('#ttmu-dry-chip').classList.toggle('hidden', !dryRun);
     $('#ttmu-dry').checked = dryRun;
-    $('#ttmu-target').value = target ? String(target) : '';
+
+    // Never overwrite the field the user is typing into — updateUI() runs every
+    // few seconds and would otherwise eat a half-typed number.
+    const tgt = $('#ttmu-target');
+    const focused = tgt.ownerDocument.activeElement === tgt;
+    if (!focused) tgt.value = target ? String(target) : '';
 
     const btn = $('#ttmu-btn');
     btn.textContent = running ? 'Stop' : 'Start';
-    btn.classList.toggle('running', running);
+    btn.classList.toggle('secondary', running);
+    // While paused, Resume is the single primary action — a second identical
+    // "Start" button beside it does the same thing and just adds doubt.
+    btn.classList.toggle('hidden', paused);
     $('#ttmu-resume').classList.toggle('hidden', !paused);
     $('#ttmu-log').classList.toggle('warn', paused);
   }
@@ -652,11 +803,16 @@
 
   // Debug / test hook.
   window.__TTMU__ = {
-    start, stop, resume, pause, setDryRun, setTarget,
+    start, stop, resume, pause, setDryRun, setTarget, resetCounters,
+    findNextButton, findLikeButton,
+    get panel() { return panel; },
     get loopPromise() { return loopPromise; },
     state: () => ({
       running, paused, pauseReason, mode, dryRun, target,
       unliked, processed, runTotal, dryTotal, total, session, sessionCap,
+      repeatPauses,
+      verifyFails: failCount(verifyTrk), verifyStreak: verifyTrk.streak,
+      navFails: failCount(navTrk), navStreak: navTrk.streak,
     }),
   };
 })();
