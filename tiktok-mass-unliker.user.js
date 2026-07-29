@@ -612,7 +612,7 @@
         --ttmu-txt: #ecebf0;
         --ttmu-txtstrong: #ffffff;
         --ttmu-m1: #9b93b3;
-        --ttmu-m7: #7d7a90;
+        --ttmu-m7: #838096;
         --ttmu-b1: #24232c;
         --ttmu-hair: rgba(255, 255, 255, .08);
         --ttmu-hairh: rgba(255, 255, 255, .14);
