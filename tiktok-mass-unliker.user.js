@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TikTok Mass Unliker
 // @namespace    flxtcg.tools
-// @version      1.6.0
+// @version      1.6.1
 // @description  Gradually unlikes videos while browsing your Liked feed. Paced clicking, session caps, and a start/stop panel.
 // @author       Felix Wang
 // @license      MIT
@@ -141,7 +141,7 @@
         mode = 'on break';
         updateUI();
         await countdownSleep(b, (s) =>
-          `☕ Break — ${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`);
+          `Break — ${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`);
         if (!running) return;
         // roll a fresh session
         unliked = 0;
@@ -216,50 +216,103 @@
     updateUI();
   }
 
-  // ---------------- UI (retro sunset: navy base, cream text, sunset orange accent) ----------------
+  // ---------------- UI ----------------
   const panel = document.createElement('div');
   panel.id = 'ttmu-panel';
   panel.innerHTML = `
     <style>
       #ttmu-panel {
+        --ttmu-ac: #8b5cf6;
+        --ttmu-ac-pale: color-mix(in srgb, var(--ttmu-ac) 45%, white);
+        --ttmu-ac-soft: color-mix(in srgb, var(--ttmu-ac) 72%, white);
+        --ttmu-surface: #17161c;
+        --ttmu-surface3: #17171c;
+        --ttmu-txt: #ecebf0;
+        --ttmu-txtstrong: #ffffff;
+        --ttmu-m1: #9b93b3;
+        --ttmu-m7: #7d7a90;
+        --ttmu-b1: #24232c;
+        --ttmu-hair: rgba(255, 255, 255, .08);
+        --ttmu-hairh: rgba(255, 255, 255, .14);
+        --ttmu-mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace;
+
         position: fixed; bottom: 20px; right: 20px; z-index: 999999;
-        width: 230px; padding: 12px 14px;
-        background: linear-gradient(180deg, #273248 0%, #1E2738 100%);
-        border: 1px solid #46536F; border-radius: 10px;
-        font-family: ui-monospace, "Cascadia Code", "JetBrains Mono", Menlo, monospace;
-        color: #FFEBD2; box-shadow: 0 12px 32px rgba(2, 8, 20, .45);
-        font-size: 12px; line-height: 1.5;
+        width: 236px; padding: 14px;
+        box-sizing: border-box;
+        background: var(--ttmu-surface);
+        border: 1px solid var(--ttmu-hair); border-radius: 14px;
+        box-shadow: 0 4px 16px rgba(8, 5, 20, .45);
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+        font-size: 12px; line-height: 1.5; color: var(--ttmu-txt);
+        font-variant-numeric: tabular-nums;
+        -webkit-font-smoothing: antialiased;
+        text-align: left;
+      }
+      #ttmu-panel *, #ttmu-panel *::before, #ttmu-panel *::after { box-sizing: border-box; }
+      #ttmu-panel h4 {
+        margin: 0 0 10px; padding: 0 0 10px;
+        border-bottom: 1px solid var(--ttmu-hair);
+        font-size: 13px; font-weight: 700; letter-spacing: -.02em;
+        color: var(--ttmu-txtstrong); font-family: inherit;
+      }
+      #ttmu-panel .row {
+        display: flex; align-items: baseline; justify-content: space-between;
+        gap: 12px; padding: 3px 0;
+      }
+      #ttmu-panel .row span {
+        color: var(--ttmu-m7); font-size: 11px; font-weight: 500; letter-spacing: .02em;
+      }
+      #ttmu-panel .row b {
+        font-family: var(--ttmu-mono); font-size: 11.5px; font-weight: 600;
+        color: var(--ttmu-txt); font-variant-numeric: tabular-nums;
+      }
+      #ttmu-panel #ttmu-status {
+        font-family: inherit; font-size: 10.5px; font-weight: 600; letter-spacing: .03em;
+        padding: 2px 7px; border-radius: 6px;
+        color: var(--ttmu-m1);
+        background: var(--ttmu-surface3);
+        border: 1px solid var(--ttmu-b1);
+        transition: color .15s, background-color .15s, border-color .15s;
+      }
+      #ttmu-panel #ttmu-status.active {
+        color: var(--ttmu-ac-pale);
+        background: color-mix(in srgb, var(--ttmu-ac) 16%, transparent);
+        border-color: color-mix(in srgb, var(--ttmu-ac-soft) 32%, transparent);
+      }
+      #ttmu-panel button {
+        width: 100%; margin-top: 12px; padding: 8px 0;
+        border: 1px solid var(--ttmu-ac); border-radius: 8px;
+        font-family: inherit; font-size: 12px; font-weight: 600; letter-spacing: -.01em;
+        cursor: pointer;
+        background: var(--ttmu-ac); color: #fff;
+        transition: color .15s, background-color .15s, border-color .15s;
+      }
+      #ttmu-panel button:hover {
+        background: color-mix(in srgb, var(--ttmu-ac) 85%, white);
+        border-color: color-mix(in srgb, var(--ttmu-ac) 85%, white);
+      }
+      #ttmu-panel button:active { transform: translateY(1px); }
+      #ttmu-panel button:focus-visible { outline: 2px solid var(--ttmu-ac); outline-offset: 2px; }
+      #ttmu-panel button.running {
+        background: var(--ttmu-surface3); border-color: var(--ttmu-b1); color: var(--ttmu-m1);
+      }
+      #ttmu-panel button.running:hover {
+        border-color: var(--ttmu-hairh); color: var(--ttmu-txt);
+        background: #1a1922;
+      }
+      #ttmu-log {
+        margin-top: 10px; padding-top: 10px;
+        border-top: 1px solid var(--ttmu-hair);
+        color: var(--ttmu-m7); font-size: 11px; min-height: 15px;
+        white-space: normal; word-break: break-word; line-height: 1.45;
         font-variant-numeric: tabular-nums;
       }
-      #ttmu-panel h4 {
-        position: relative; margin: 0 0 12px; padding-bottom: 8px;
-        font-size: 13px; font-weight: 700; letter-spacing: .05em;
-        color: #FFEBD2;
-      }
-      #ttmu-panel h4::before { content: "▂ "; color: #FC7643; }
-      #ttmu-panel h4::after {
-        content: ""; position: absolute; left: 0; right: 0; bottom: 0;
-        height: 4px; border-radius: 2px;
-        background: linear-gradient(90deg, #FFA364 0%, #FC7643 50%, #AF4F41 100%);
-      }
-      #ttmu-panel .row { display: flex; justify-content: space-between; margin: 3px 0; gap: 12px; }
-      #ttmu-panel .row span { color: #A2ABBE; }
-      #ttmu-panel button {
-        width: 100%; margin-top: 10px; padding: 7px 0; border: 1px solid #FC7643; border-radius: 6px;
-        font-family: inherit; font-weight: 700; font-size: 12px; cursor: pointer;
-        background: #FC7643; color: #2A1408;
-      }
-      #ttmu-panel button:hover { background: #FFA364; border-color: #FFA364; }
-      #ttmu-panel button.running { background: #313E58; color: #FFA364; border: 1px solid #FFA364; }
-      #ttmu-log { margin-top: 8px; color: #A2ABBE; font-size: 11px; min-height: 14px;
-        white-space: normal; word-break: break-word; line-height: 1.4;
-        font-variant-numeric: tabular-nums; }
     </style>
-    <h4>TikTok Mass Unliker</h4>
+    <h4>TikTok mass unliker</h4>
     <div class="row"><span>Session</span><b id="ttmu-count">–</b></div>
     <div class="row"><span>Total</span><b id="ttmu-total">0</b></div>
     <div class="row"><span>Status</span><b id="ttmu-status">idle</b></div>
-    <button id="ttmu-btn">START</button>
+    <button id="ttmu-btn">Start</button>
     <div id="ttmu-log">Open a video in your Liked tab first.</div>
   `;
   document.body.appendChild(panel);
@@ -272,9 +325,11 @@
   function updateUI() {
     $('#ttmu-count').textContent = sessionCap ? `${unliked} / ${sessionCap}` : '–';
     $('#ttmu-total').textContent = total;
-    $('#ttmu-status').textContent = mode;
+    const status = $('#ttmu-status');
+    status.textContent = mode;
+    status.classList.toggle('active', running);
     const btn = $('#ttmu-btn');
-    btn.textContent = running ? 'STOP' : 'START';
+    btn.textContent = running ? 'Stop' : 'Start';
     btn.classList.toggle('running', running);
   }
 
