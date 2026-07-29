@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         TikTok Mass Unliker
 // @namespace    flxtcg.tools
-// @version      1.8.0
-// @description  Gradually unlikes videos while browsing your Liked feed. Paced clicking, windowed click verification, container-scoped selectors, session caps, dry run, target count, and a start/stop panel.
+// @version      1.9.0
+// @description  Gradually unlikes videos while browsing your own Liked feed. Liked-feed page guard, paced clicking, windowed + cumulative click verification, container-scoped selectors, session caps, dry run, target count, and a start/stop panel.
 // @author       Felix Wang
 // @license      MIT
 // @match        https://www.tiktok.com/*
@@ -26,7 +26,9 @@
     clickJitterMs: 400,       // random pause between "seeing" and clicking
     verifyMinMs: 300,         // wait before re-reading the like state after a click
     verifyMaxMs: 500,
-    strikes: 3,               // consecutive "no like button" failures before pausing
+    strikes: 6,               // consecutive "no like button" failures before pausing
+    missWaitMs: 4000,         //   wait after the first miss, growing per strike
+    missWaitMaxMs: 9000,      //   ~39s of total patience for a lazy load
 
     // Failure tracking is WINDOWED, not consecutive-only: an alternating
     // good/bad pattern resets a consecutive counter forever, so a rolling
@@ -39,10 +41,39 @@
     navWindowFails: 3,        //   pause at this many failures inside the window
     navConsecutive: 3,        //   fast path: this many failed advances in a row
 
-    sessionIdleMs: 6 * 3600000, // persisted session window expires after 6h idle
+    // A window bounds the failure RATE, not the total: a perfectly periodic
+    // 1-in-5 failure pattern never fills a window and would otherwise re-like
+    // videos forever. This is the absolute per-run ceiling on top of it.
+    verifyFailCeiling: 10,
+
+    // Determinacy: isLiked() returning null records nothing about clicks, so a
+    // DOM change used to run silently for hours with runTotal stuck at 0.
+    detWindow: 10,            // remember the last N like-state reads
+    detWindowFails: 6,        //   pause at this many unreadable reads in the window
+    detConsecutive: 4,        //   fast path: this many unreadable in a row
+
+    sessionIdleMs: 12 * 3600000, // persisted session window expires after 12h idle
     resumeBackoffMs: 30000,   // first backoff after a repeated same-reason pause
     resumeBackoffMaxMs: 5 * 60000,
     resumeGiveUpAfter: 5,     // refuse to resume after this many identical pauses
+    logHistory: 40,           // lines of scrollback kept in the panel log
+  };
+
+  // Stable pause CODES. Escalation (backoff, then refusal) keys on these, never
+  // on the human-readable reason: window trips embed live counters, so three
+  // different failure patterns produced three different strings and silently
+  // disarmed the 5-strike give-up counter.
+  const P = {
+    GUARD: 'guard',
+    NO_LIKE_BTN: 'no-like-button',
+    INDETERMINATE: 'indeterminate',
+    VERIFY_STREAK: 'verify-streak',
+    VERIFY_WINDOW: 'verify-window',
+    VERIFY_CEILING: 'verify-ceiling',
+    NAV_STREAK: 'nav-streak',
+    NAV_WINDOW: 'nav-window',
+    NAV_LABELS: 'nav-labels',
+    ERROR: 'error',
   };
 
   // ---------------- Storage ----------------
@@ -76,6 +107,7 @@
   let running = false;
   let paused = false;
   let pauseReason = '';
+  let pauseCode = '';
   let dryRun = false;
   let target = 0;      // 0 = no target
 
@@ -87,14 +119,23 @@
   let session = 1;     // current session number
   let sessionCap = 0;  // rolled per cap window
 
+  let attempts = 0;         // real unlike clicks attempted this session (persisted)
+  let verifyFailsTotal = 0; // clicks that did NOT verify, cumulative (persisted)
+
   let missing = 0;     // consecutive "no like button" failures
   let loopPromise = null;
   let mode = 'idle';   // idle | running | break | paused | done
 
   let lastActivity = Date.now(); // only real work refreshes the session clock
-  let lastPauseReason = '';
+  let lastPauseCode = '';
   let repeatPauses = 0;
   let resumeBackoffMs = 0;
+  let ownHandleCache = '';
+  let hiddenWarned = false;
+
+  // The log used to be a single overwritten line, so a warning was readable for
+  // a couple of seconds and then gone. Keep a capped, selectable scrollback.
+  const logHist = [];
 
   const rand = (min, max) => Math.floor(min + Math.random() * (max - min));
 
@@ -122,11 +163,15 @@
   const verifyTrk = tracker(CFG.verifyWindow, CFG.verifyWindowFails, CFG.verifyConsecutive);
   // nav: did the URL actually change after clicking next?
   const navTrk = tracker(CFG.navWindow, CFG.navWindowFails, CFG.navConsecutive);
+  // det: could the like state be read at all? A total detection failure records
+  // nothing in the other two trackers, so without this the loop runs for hours.
+  const detTrk = tracker(CFG.detWindow, CFG.detWindowFails, CFG.detConsecutive);
 
   function clearStrikes() {
     missing = 0;
     clearTracker(verifyTrk);
     clearTracker(navTrk);
+    clearTracker(detTrk);
   }
 
   // ---------------- Abortable sleep ----------------
@@ -172,12 +217,15 @@
       total,
       target,
       dryRun,
+      handle: ownHandleCache,
       session: {
         unliked,
         processed,
         cap: sessionCap,
         runTotal,
         dryTotal,
+        attempts,
+        verifyFailsTotal,
         num: session,
         at: lastActivity,
       },
@@ -189,6 +237,7 @@
     total = Number(s.total) || 0;
     target = Number(s.target) || 0;
     dryRun = !!s.dryRun;
+    ownHandleCache = typeof s.handle === 'string' ? s.handle : '';
     const sess = s.session;
     const at = sess ? Number(sess.at) || 0 : 0;
     if (sess && Date.now() - at < CFG.sessionIdleMs) {
@@ -196,12 +245,20 @@
       processed = Number(sess.processed) || 0;
       sessionCap = Number(sess.cap) || 0;
       runTotal = Number(sess.runTotal) || 0;
+      attempts = Number(sess.attempts) || 0;
+      verifyFailsTotal = Number(sess.verifyFailsTotal) || 0;
       session = Number(sess.num) || 1;
       // dryTotal lives behind the SAME expiry as runTotal — otherwise a dry run
       // that hit its target insta-"finishes" days later with nothing processed.
       dryTotal = Number(sess.dryTotal ?? s.dryTotal) || 0;
       lastActivity = at;
     } else {
+      // Expiry silently zeroed runTotal/sessionCap mid-job in earlier versions.
+      // It is loud now, because "0 unlikes" after a long run needs a reason.
+      if (sess && (Number(sess.runTotal) || Number(sess.dryTotal))) {
+        log(`Previous session expired (idle over ${Math.round(CFG.sessionIdleMs / 3600000)}h) — ` +
+            `session counters reset to 0. Lifetime total kept: ${total}.`);
+      }
       lastActivity = Date.now();
     }
   }
@@ -214,9 +271,11 @@
     processed = 0;
     runTotal = 0;
     dryTotal = 0;
+    attempts = 0;
+    verifyFailsTotal = 0;
     sessionCap = 0;
     session = 1;
-    lastPauseReason = '';
+    lastPauseCode = '';
     repeatPauses = 0;
     resumeBackoffMs = 0;
     clearStrikes();
@@ -225,6 +284,66 @@
     save(true);
     log('Counters reset. Lifetime total kept.');
     updateUI();
+  }
+
+  // ---------------- Page guard ----------------
+  // The container selectors below match TikTok's video viewer EVERYWHERE — For
+  // You, hashtag pages, someone else's profile. Without this guard, reloading
+  // onto For You and pressing Start from habit strips likes off the wrong feed
+  // at ~500/hour. Nothing starts, and nothing keeps running, unless the
+  // location still looks like the user's own liked view.
+  const HANDLE_RE = /^\/@([^/?#]+)/;
+
+  function ownHandle() {
+    for (const sel of [
+      'a[data-e2e="nav-profile"]',
+      '[data-e2e="profile-icon"] a[href^="/@"]',
+      'a[data-e2e="user-detail-profile"]',
+    ]) {
+      const el = document.querySelector(sel);
+      const href = el && (el.getAttribute('href') || '');
+      const m = href && href.match(HANDLE_RE);
+      if (m) {
+        const h = decodeURIComponent(m[1]).toLowerCase();
+        if (h && h !== ownHandleCache) { ownHandleCache = h; save(false); }
+        return h;
+      }
+    }
+    return ownHandleCache || '';   // last known handle survives the video modal
+  }
+
+  // 'yes' | 'no' | 'unknown'. Unknown is never a veto on its own — the tab strip
+  // is not always rendered behind the video modal.
+  function likedTabState() {
+    const tab = document.querySelector('[data-e2e="liked-tab"]');
+    if (!tab) return 'unknown';
+    const sel = tab.getAttribute('aria-selected')
+      ?? tab.closest('[aria-selected]')?.getAttribute('aria-selected');
+    if (sel === 'true') return 'yes';
+    if (sel === 'false') return 'no';
+    return 'unknown';
+  }
+
+  // { ok, msg }. Called before start() and again on every loop iteration.
+  function pageGuard() {
+    const m = (location.pathname || '').match(HANDLE_RE);
+    if (!m) {
+      return { ok: false, msg: 'Not on a profile page — this looks like For You, a hashtag or search feed. ' +
+        'Open your own profile, pick the Liked tab, then open a video from it.' };
+    }
+    const here = decodeURIComponent(m[1]).toLowerCase();
+    const own = ownHandle();
+    if (own && here !== own) {
+      return { ok: false, msg: `This is @${here}'s profile, not yours (@${own}) — refusing to unlike here.` };
+    }
+    if (likedTabState() === 'no') {
+      return { ok: false, msg: 'The Liked tab is not the selected tab on this profile — open Liked first.' };
+    }
+    if (!own) {
+      return { ok: false, msg: "Can't confirm this is your own Liked feed — your profile link wasn't found on the page. " +
+        'Open your profile, pick the Liked tab, then open a video from it.' };
+    }
+    return { ok: true, msg: '' };
   }
 
   // ---------------- Like button detection ----------------
@@ -238,12 +357,34 @@
     'div[class*="DivVideoDetailContainer"]',
   ];
 
+  // In a multi-item feed the first document-wide match is not necessarily the
+  // video on screen, so matches are scored by how much of the viewport they
+  // cover and the most-visible one wins. Selector order breaks ties.
+  function visibleArea(el) {
+    if (typeof el.getBoundingClientRect !== 'function') return 0;
+    const r = el.getBoundingClientRect();
+    if (!r) return 0;
+    const vh = (typeof innerHeight === 'number' && innerHeight) || 1080;
+    const vw = (typeof innerWidth === 'number' && innerWidth) || 1920;
+    const h = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
+    const w = Math.max(0, Math.min(r.right, vw) - Math.max(r.left, 0));
+    return h * w;
+  }
+
   function activeContainer() {
+    let best = null;
+    let bestArea = -1;
     for (const sel of CONTAINER_SELECTORS) {
-      const el = document.querySelector(sel);
-      if (el) return el;
+      const found = document.querySelectorAll(sel);
+      for (const el of found) {
+        const a = visibleArea(el);
+        if (a > bestArea) { best = el; bestArea = a; }
+      }
+      // A selector earlier in the list is more specific: once it matched
+      // anything visible, don't let a looser selector outrank it.
+      if (best && bestArea > 0) return best;
     }
-    return null;
+    return best;
   }
 
   // TikTok's DOM shifts often; try several strategies, most specific first.
@@ -301,9 +442,13 @@
   // Synthetic ArrowDown keydowns are ignored (isTrusted check), but
   // clicking the real button element works.
   // Anything destructive or share-y that must never be mistaken for "next".
-  // A substring match on "down" used to hit "Download this video".
+  // WORD-BOUNDED, and only a veto when the allow pattern didn't match: as an
+  // unbounded substring list it blocked legitimate next-buttons whose labels
+  // merely contained "profile" ("Next video in profile feed" — and the liked
+  // feed IS on the profile page), "collect" ("in this collection"), "comment"
+  // ("comment count 12"), "mute" ("· muted") or "screen" ("fullscreen").
   const NEXT_DENY_RE =
-    /download|share|save|report|copy|embed|bookmark|favorit|collect|comment|follow|block|delete|mute|volume|speed|screen|repost|duet|stitch|profile|search|upload/i;
+    /(^|[^a-z])(download|share|report|copy|embed|bookmark|favou?rite[sd]?|repost|duet|stitch|delete|remove|block|upload|save)([^a-z]|$)/i;
   // Precise next / arrow-down semantics. Word-bounded, so "Download" cannot
   // match "down" and "nextdoor"-style labels cannot match "next".
   const NEXT_ALLOW_RE =
@@ -312,9 +457,19 @@
   const labelOf = (el) =>
     (el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
 
+  // The deny list only vetoes when the allow pattern did NOT clearly match, so
+  // "swipe down to save" is still a next control while "Save video" is not.
+  const vetoed = (label) =>
+    NEXT_DENY_RE.test(label) && !NEXT_ALLOW_RE.test(label);
+
+  // Why the last lookup found nothing: '' | 'no-container' | 'no-labels' | 'no-match'.
+  // 'no-match' means buttons were labelled but none read as "next" — the usual
+  // cause is a non-English TikTok UI, which deserves its own message.
+  let lastNextMiss = '';
+
   function findNextButton() {
     const scope = activeContainer();
-    if (!scope) return null;   // fail safe — never scan the whole document
+    if (!scope) { lastNextMiss = 'no-container'; return null; }
     // Most specific: TikTok's own hooks. Still deny-checked in case the hook
     // is reused on a control that does something else.
     for (const sel of [
@@ -322,15 +477,18 @@
       'button[data-e2e="browse-video-next"]',
     ]) {
       const el = scope.querySelector(sel);
-      if (el && !el.disabled && !NEXT_DENY_RE.test(labelOf(el))) return el;
+      if (el && !el.disabled && !vetoed(labelOf(el))) { lastNextMiss = ''; return el; }
     }
+    let labelled = 0;
     for (const b of scope.querySelectorAll('button')) {
       if (b.disabled) continue;
       const label = labelOf(b);
       if (!label) continue;
-      if (NEXT_DENY_RE.test(label)) continue;
-      if (NEXT_ALLOW_RE.test(label)) return b;
+      labelled++;
+      if (vetoed(label)) continue;
+      if (NEXT_ALLOW_RE.test(label)) { lastNextMiss = ''; return b; }
     }
+    lastNextMiss = labelled ? 'no-match' : 'no-labels';
     return null;
   }
 
@@ -375,6 +533,15 @@
 
     while (running && !paused) {
       try {
+        // --- still on our own liked view? re-checked every iteration, because
+        //     TikTok can navigate under us (autoplay into For You, a tapped
+        //     hashtag, a back button) and the selectors match those pages too.
+        const guard = pageGuard();
+        if (!guard.ok) {
+          pause(P.GUARD, `Left the Liked feed — ${guard.msg}`);
+          return;
+        }
+
         // --- target reached? ---
         const done = dryRun ? dryTotal : runTotal;
         if (targetReached()) {
@@ -410,16 +577,28 @@
           log(`No like button found (${missing}/${CFG.strikes})…`);
           updateUI();
           if (missing >= CFG.strikes) {
-            pause("Can't find the like button — are you on the Liked feed?");
+            pause(P.NO_LIKE_BTN, "Can't find the like button in the video container — TikTok's layout may have changed, or the video hasn't loaded.");
             return;
           }
-          await sleep(4000);
+          // Patience grows with each strike: a lazy load gets ~39s, not 12s.
+          await sleep(Math.min(CFG.missWaitMs + (missing - 1) * 1000, CFG.missWaitMaxMs));
           continue;
         }
         missing = 0;
 
         processed++;
         const liked = isLiked(btn);
+        // Determinacy tracker: a null read records nothing in the verify or nav
+        // trackers, so without this a DOM change ran silently for hours with the
+        // panel reading "running" and runTotal stuck at 0.
+        record(detTrk, liked !== null);
+        if (streakTripped(detTrk) || windowTripped(detTrk)) {
+          const bad = failCount(detTrk);
+          pause(P.INDETERMINATE,
+            `Can't read the like state — ${bad} of the last ${detTrk.hist.length} videos were unreadable. ` +
+            "TikTok's DOM has probably changed; the script would otherwise keep looping and unlike nothing.");
+          return;
+        }
         await sleep(rand(200, CFG.clickJitterMs)); // human "reaction time"
         if (!running || paused) return;
 
@@ -429,6 +608,7 @@
             unliked++;
             log(`Would unlike #${dryTotal} (dry run)`);
           } else {
+            attempts++;
             btn.click();
             // verify the click actually flipped the state
             await sleep(rand(CFG.verifyMinMs, CFG.verifyMaxMs));
@@ -441,19 +621,27 @@
               total++;
               log(`Unliked #${total}`);
             } else {
+              verifyFailsTotal++;
               const fails = failCount(verifyTrk);
               log(after === true
-                ? `Warning: click did not unlike (${verifyTrk.streak} in a row, ${fails}/${CFG.verifyWindow} recent) — not counted.`
-                : `Warning: could not verify the click (${fails}/${CFG.verifyWindow} recent) — not counted.`);
+                ? `Warning: click did not unlike (${verifyTrk.streak} in a row, ${fails}/${CFG.verifyWindow} recent, ${verifyFailsTotal} this run) — not counted.`
+                : `Warning: could not verify the click (${fails}/${CFG.verifyWindow} recent, ${verifyFailsTotal} this run) — not counted.`);
               // Consecutive run is the fast path; the windowed rate is what
               // catches an alternating misdetect pattern, which would otherwise
               // re-LIKE videos forever while resetting a consecutive counter.
               if (streakTripped(verifyTrk)) {
-                pause(`${CFG.verifyConsecutive} clicks in a row left the video liked — stopping before we like something by mistake.`);
+                pause(P.VERIFY_STREAK, `${CFG.verifyConsecutive} clicks in a row left the video liked — stopping before we like something by mistake.`);
                 return;
               }
               if (windowTripped(verifyTrk)) {
-                pause(`${fails} of the last ${verifyTrk.hist.length} clicks failed to verify — stopping before we like something by mistake.`);
+                pause(P.VERIFY_WINDOW, `${fails} of the last ${verifyTrk.hist.length} clicks failed to verify — stopping before we like something by mistake.`);
+                return;
+              }
+              // The window bounds the failure RATE only: a perfectly periodic
+              // 1-in-5 pattern never fills it and ran forever. This is the
+              // absolute cumulative ceiling for the run.
+              if (verifyFailsTotal >= CFG.verifyFailCeiling) {
+                pause(P.VERIFY_CEILING, `${verifyFailsTotal} clicks have failed to verify this run — that is the ceiling, regardless of how spread out they were. Reset counters to clear it.`);
                 return;
               }
             }
@@ -481,18 +669,29 @@
         if (!advanced) {
           const fails = failCount(navTrk);
           log(`Couldn't advance to next video (${navTrk.streak} in a row, ${fails}/${CFG.navWindow} recent)…`);
+          // A non-English UI matches no next-label at all. Saying "end of feed"
+          // there sends the user looking for the wrong problem.
+          const langHint = lastNextMiss === 'no-match';
           if (streakTripped(navTrk)) {
-            pause('Stuck on the same video — end of feed, or the next button moved.');
+            if (langHint) {
+              pause(P.NAV_LABELS, "No button in the viewer is labelled like a next-video control. The next-button is matched on English labels — if TikTok's UI is in another language, switch it to English or navigate manually.");
+            } else {
+              pause(P.NAV_STREAK, 'Stuck on the same video — end of feed, or the next button moved.');
+            }
             return;
           }
           if (windowTripped(navTrk)) {
-            pause(`Navigation failed ${fails} of the last ${navTrk.hist.length} times — end of feed, or the next button moved.`);
+            if (langHint) {
+              pause(P.NAV_LABELS, `Navigation failed ${fails} of the last ${navTrk.hist.length} times and no button matched a next-video label — TikTok's UI may not be in English.`);
+            } else {
+              pause(P.NAV_WINDOW, `Navigation failed ${fails} of the last ${navTrk.hist.length} times — end of feed, or the next button moved.`);
+            }
             return;
           }
         }
         await sleep(rand(CFG.delayMinMs, CFG.delayMaxMs));
       } catch (err) {
-        pause(`Error: ${(err && err.message) || err}`);
+        pause(P.ERROR, `Error: ${(err && err.message) || err}`);
         return;
       }
     }
@@ -511,9 +710,21 @@
   // ---------------- Start / stop / pause ----------------
   function start() {
     if (running) return;
+    // Refuse rather than pause: nothing has run yet, so there is nothing to
+    // resume, and this is the case where pressing Start from habit on For You
+    // would have stripped likes off the wrong feed.
+    const guard = pageGuard();
+    if (!guard.ok) {
+      mode = 'idle';
+      log(`Not starting — ${guard.msg}`);
+      updateUI();
+      return;
+    }
     clearStrikes();
+    hiddenWarned = false;
     paused = false;
     pauseReason = '';
+    pauseCode = '';
     running = true;
     mode = 'running';
     if (!sessionCap) {
@@ -530,6 +741,7 @@
     running = false;
     paused = false;
     pauseReason = '';
+    pauseCode = '';
     resumeBackoffMs = 0;
     mode = 'idle';
     abortSleep();
@@ -542,6 +754,7 @@
     running = false;
     paused = false;
     pauseReason = '';
+    pauseCode = '';
     mode = 'done';
     abortSleep();
     log(msg);
@@ -550,13 +763,17 @@
   }
 
   // Anomaly stop: distinct from a user-initiated stop, and resumable.
-  function pause(reason) {
+  // Escalation keys on `code`, not on `reason`: the window trips embed live
+  // counters ("3 of the last 5…", "3 of the last 7…"), so comparing strings
+  // reset repeatPauses to 1 every time and the give-up never fired.
+  function pause(code, reason) {
     running = false;
     paused = true;
+    pauseCode = code;
     pauseReason = reason;
     mode = 'paused';
-    if (reason === lastPauseReason) repeatPauses++;
-    else { lastPauseReason = reason; repeatPauses = 1; }
+    if (code === lastPauseCode) repeatPauses++;
+    else { lastPauseCode = code; repeatPauses = 1; }
     abortSleep();
     log(repeatPauses > 1
       ? `Paused (${repeatPauses}× for this reason): ${reason}`
@@ -719,13 +936,20 @@
         border-color: var(--ttmu-hairh); color: var(--ttmu-txt);
         background: #1a1922;
       }
-      #ttmu-panel #ttmu-reset { margin-top: 6px; padding: 6px 0; font-size: 11.5px; }
+      #ttmu-panel .btnrow { display: flex; gap: 6px; }
+      #ttmu-panel .btnrow button {
+        flex: 1; white-space: nowrap;
+        margin-top: 6px; padding: 6px 0; font-size: 11.5px;
+      }
+      #ttmu-panel .warnval { color: var(--ttmu-warn); }
       #ttmu-log {
         margin-top: 10px; padding-top: 10px;
         border-top: 1px solid var(--ttmu-hair);
-        color: var(--ttmu-m7); font-size: 11px; min-height: 15px;
-        white-space: normal; word-break: break-word; line-height: 1.45;
+        color: var(--ttmu-m7); font-size: 11px;
+        min-height: 15px; max-height: 96px; overflow-y: auto; overscroll-behavior: contain;
+        white-space: pre-wrap; word-break: break-word; line-height: 1.45;
         font-variant-numeric: tabular-nums;
+        user-select: text; -webkit-user-select: text;
       }
       #ttmu-log.warn { color: var(--ttmu-warn); }
     </style>
@@ -733,6 +957,7 @@
     <div class="row"><span>This session</span><b id="ttmu-run">0</b></div>
     <div class="row"><span>All time</span><b id="ttmu-total">0</b></div>
     <div class="row"><span>Window</span><b id="ttmu-count">–</b></div>
+    <div class="row"><span>Clicks ok / failed</span><b id="ttmu-verify">0 / 0</b></div>
     <div class="row"><span>Status</span><b id="ttmu-status">idle</b></div>
     <div class="row"><span>Mode</span><b id="ttmu-dry-chip" class="hidden">dry run</b></div>
     <div class="sep opt">
@@ -745,8 +970,11 @@
     </div>
     <button id="ttmu-resume" class="hidden">Resume</button>
     <button id="ttmu-btn">Start</button>
-    <button id="ttmu-reset" class="secondary">Reset counters</button>
-    <div id="ttmu-log">Open a video in your Liked tab first.</div>
+    <div class="btnrow">
+      <button id="ttmu-reset" class="secondary">Reset counters</button>
+      <button id="ttmu-copy" class="secondary">Copy log</button>
+    </div>
+    <div id="ttmu-log"></div>
   `;
   document.body.appendChild(panel);
 
@@ -760,6 +988,18 @@
   });
   $('#ttmu-resume').addEventListener('click', () => resume());
   $('#ttmu-reset').addEventListener('click', () => resetCounters());
+  $('#ttmu-copy').addEventListener('click', () => copyLog());
+
+  // The README tells you to keep the tab focused; nothing used to check. A
+  // background tab gets its timers throttled, so pacing quietly falls apart.
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && running && !hiddenWarned) {
+      hiddenWarned = true;
+      log('Tab is in the background — browsers throttle background timers, so pacing will drift. Bring this tab back to the front.');
+    } else if (!document.hidden) {
+      hiddenWarned = false;
+    }
+  });
   $('#ttmu-dry').addEventListener('change', (e) => setDryRun(e.target.checked));
   $('#ttmu-target').addEventListener('change', (e) => setTarget(e.target.value));
 
@@ -769,6 +1009,12 @@
     $('#ttmu-count').textContent = sessionCap
       ? `${unliked} / ${sessionCap} · ${processed}v`
       : '–';
+
+    // Attempted-vs-verified is the number that tells you whether the script is
+    // doing what it claims, so it belongs on screen and not just in a hook.
+    const verified = $('#ttmu-verify');
+    verified.textContent = `${attempts - verifyFailsTotal} / ${verifyFailsTotal}`;
+    verified.classList.toggle('warnval', verifyFailsTotal > 0);
 
     const status = $('#ttmu-status');
     status.textContent = paused ? 'paused' : mode;
@@ -794,25 +1040,60 @@
     $('#ttmu-log').classList.toggle('warn', paused);
   }
 
+  function stamp() {
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  }
+
   function log(msg) {
-    $('#ttmu-log').textContent = msg;
+    logHist.push(`${stamp()}  ${msg}`);
+    while (logHist.length > CFG.logHistory) logHist.shift();
+    const el = $('#ttmu-log');
+    if (el) {
+      el.textContent = logHist.join('\n');
+      el.scrollTop = el.scrollHeight;
+    }
     console.log('[TTMU]', msg);
+  }
+
+  function copyLog() {
+    const text = logHist.join('\n');
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text);
+        log('Log copied to the clipboard.');
+        return;
+      }
+    } catch (e) { /* fall through */ }
+    console.log('[TTMU] log:\n' + text);
+    log('Clipboard unavailable — the log was printed to the console instead.');
   }
 
   updateUI();
 
+  {
+    const g = pageGuard();
+    log(g.ok
+      ? 'Ready — this looks like your own Liked feed. Press Start.'
+      : `Not ready — ${g.msg}`);
+  }
+
   // Debug / test hook.
   window.__TTMU__ = {
+    CFG, P,
     start, stop, resume, pause, setDryRun, setTarget, resetCounters,
-    findNextButton, findLikeButton,
+    findNextButton, findLikeButton, pageGuard, ownHandle,
     get panel() { return panel; },
     get loopPromise() { return loopPromise; },
+    logHistory: () => logHist.slice(),
     state: () => ({
-      running, paused, pauseReason, mode, dryRun, target,
+      running, paused, pauseCode, pauseReason, mode, dryRun, target,
       unliked, processed, runTotal, dryTotal, total, session, sessionCap,
-      repeatPauses,
+      repeatPauses, attempts, verifyFailsTotal, lastNextMiss,
       verifyFails: failCount(verifyTrk), verifyStreak: verifyTrk.streak,
       navFails: failCount(navTrk), navStreak: navTrk.streak,
+      detFails: failCount(detTrk), detStreak: detTrk.streak,
     }),
   };
 })();
