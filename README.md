@@ -1,6 +1,6 @@
 # TikTok Mass Unliker
 
-A userscript that gradually unlikes videos while you browse your own Liked feed on TikTok. It works in paced sessions with randomized delays and caps, and shows a floating panel with live progress, a dry run mode, a target count, and a Start/Stop button.
+A Chrome extension / userscript that gradually unlikes videos while you browse your own Liked feed on TikTok. It works in paced sessions with randomized delays and caps, and shows a floating panel with live progress, a dry run mode, a target count, and a Start/Stop button.
 
 ## Features
 
@@ -20,6 +20,16 @@ A userscript that gradually unlikes videos while you browse your own Liked feed 
 - **Reset counters** — a button that clears the session, run, and dry-run counters (lifetime total is kept)
 
 ## Installation
+
+### As an unpacked Chrome extension
+
+1. Download or clone this repository
+2. Open `chrome://extensions`, enable **Developer mode** (top right)
+3. Click **Load unpacked** and select the repository folder
+
+The same script runs as a content script; state is kept in the site's `localStorage` instead of userscript storage.
+
+### As a userscript
 
 1. Install a userscript manager such as [Tampermonkey](https://www.tampermonkey.net/) or [Violentmonkey](https://violentmonkey.github.io/)
 2. Open `tiktok-mass-unliker.user.js` from this repository and install it (your userscript manager will detect it), or create a new script and paste in the contents

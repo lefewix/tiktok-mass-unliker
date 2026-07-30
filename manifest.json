@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "TikTok Mass Unliker",
+  "version": "1.9.0",
+  "description": "Gradually unlikes videos while browsing your own Liked feed. Paced clicking, click verification, session caps, dry run, and a start/stop panel.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.tiktok.com/*"],
+      "js": ["tiktok-mass-unliker.user.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
