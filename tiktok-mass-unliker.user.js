@@ -819,21 +819,21 @@
   panel.innerHTML = `
     <style>
       #ttmu-panel {
-        --ttmu-ac: #433633;
-        --ttmu-ac2: #5c5552;
-        --ttmu-ac-pale: #6b5744;
-        --ttmu-ac-soft: #decbb7;
-        --ttmu-warn: #946300;
-        --ttmu-surface: #fffdfb;
-        --ttmu-surface3: #fbf6f2;
-        --ttmu-inp: #fffdfb;
-        --ttmu-txt: #433633;
-        --ttmu-txtstrong: #2a211e;
-        --ttmu-m1: #5c5552;
-        --ttmu-m7: #8f857d;
-        --ttmu-b1: #e0d5cb;
-        --ttmu-hair: rgba(67, 54, 51, .12);
-        --ttmu-hairh: rgba(67, 54, 51, .24);
+        --ttmu-ac: #a288a6;
+        --ttmu-ac2: #b299b6;
+        --ttmu-ac-pale: #c9b3cc;
+        --ttmu-ac-soft: #bb9bb0;
+        --ttmu-warn: #d9aa5e;
+        --ttmu-surface: #232428;
+        --ttmu-surface3: #27282d;
+        --ttmu-inp: #141518;
+        --ttmu-txt: #f1e3e4;
+        --ttmu-txtstrong: #ffffff;
+        --ttmu-m1: #ccbcbc;
+        --ttmu-m7: #948a8e;
+        --ttmu-b1: #35363c;
+        --ttmu-hair: rgba(241, 227, 228, .09);
+        --ttmu-hairh: rgba(241, 227, 228, .16);
         --ttmu-mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace;
 
         position: fixed; bottom: 20px; right: 20px; z-index: 999999;
@@ -841,7 +841,7 @@
         box-sizing: border-box;
         background: var(--ttmu-surface);
         border: 1px solid var(--ttmu-hair); border-radius: 14px;
-        box-shadow: 0 8px 24px rgba(0, 0, 0, .28);
+        box-shadow: 0 8px 24px rgba(0, 0, 0, .5);
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
         font-size: 12px; line-height: 1.5; color: var(--ttmu-txt);
         font-variant-numeric: tabular-nums;
@@ -899,8 +899,8 @@
       }
       #ttmu-panel #ttmu-status.active {
         color: var(--ttmu-ac-pale);
-        background: color-mix(in srgb, var(--ttmu-ac-soft) 40%, transparent);
-        border-color: color-mix(in srgb, var(--ttmu-ac-soft) 90%, transparent);
+        background: color-mix(in srgb, var(--ttmu-ac) 18%, transparent);
+        border-color: color-mix(in srgb, var(--ttmu-ac-soft) 35%, transparent);
       }
       #ttmu-panel #ttmu-status.warn {
         color: var(--ttmu-warn);
@@ -911,8 +911,8 @@
         font-family: inherit; font-size: 10.5px; font-weight: 600; letter-spacing: .03em;
         padding: 2px 7px; border-radius: 6px;
         color: var(--ttmu-ac-pale);
-        background: color-mix(in srgb, var(--ttmu-ac-soft) 40%, transparent);
-        border: 1px dashed color-mix(in srgb, var(--ttmu-ac-soft) 100%, transparent);
+        background: color-mix(in srgb, var(--ttmu-ac) 18%, transparent);
+        border: 1px dashed color-mix(in srgb, var(--ttmu-ac-soft) 45%, transparent);
       }
       #ttmu-panel .hidden { display: none; }
       #ttmu-panel button {
@@ -920,7 +920,7 @@
         border: 1px solid var(--ttmu-ac); border-radius: 8px;
         font-family: inherit; font-size: 12px; font-weight: 600; letter-spacing: -.01em;
         cursor: pointer;
-        background: var(--ttmu-ac); color: #f7f0f5;
+        background: var(--ttmu-ac); color: #1c1d21;
         transition: color .15s, background-color .15s, border-color .15s;
       }
       #ttmu-panel button:hover {
@@ -935,7 +935,7 @@
       }
       #ttmu-panel button.secondary:hover {
         border-color: var(--ttmu-hairh); color: var(--ttmu-txt);
-        background: #efe7e0;
+        background: #2c2d33;
       }
       #ttmu-panel .btnrow { display: flex; gap: 6px; }
       #ttmu-panel .btnrow button {
