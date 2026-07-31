@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         TikTok Mass Unliker
 // @namespace    flxtcg.tools
-// @version      1.9.0
-// @description  Gradually unlikes videos while browsing your own Liked feed. Liked-feed page guard, paced clicking, windowed + cumulative click verification, container-scoped selectors, session caps, dry run, target count, and a start/stop panel.
+// @version      2.0.0
+// @description  Gradually unlikes videos while browsing your own Liked feed. Liked-feed page guard, confirm-armed start, dry-run-by-default first run, paced clicking, windowed + cumulative click verification, container-scoped selectors, session caps, target count, unliked-URL export, and a movable start/stop panel.
 // @author       Felix Wang
 // @license      MIT
 // @match        https://www.tiktok.com/*
@@ -57,6 +57,8 @@
     resumeBackoffMaxMs: 5 * 60000,
     resumeGiveUpAfter: 5,     // refuse to resume after this many identical pauses
     logHistory: 40,           // lines of scrollback kept in the panel log
+    confirmArmMs: 5000,       // how long an armed confirm button stays armed
+    urlHistoryMax: 2000,      // unliked-URL recovery list cap (persisted)
   };
 
   // Stable pause CODES. Escalation (backoff, then refusal) keys on these, never
@@ -73,6 +75,7 @@
     NAV_STREAK: 'nav-streak',
     NAV_WINDOW: 'nav-window',
     NAV_LABELS: 'nav-labels',
+    HIDDEN: 'hidden-tab',
     ERROR: 'error',
   };
 
@@ -93,6 +96,9 @@
     }
   }
 
+  // Caveat: without GM_* grants this falls back to page-shared localStorage,
+  // which the page's own scripts can read/clear and which is wiped by a
+  // "clear site data". Counters and the unliked-URL list are best-effort there.
   function writeStore(obj) {
     try {
       const raw = JSON.stringify(obj);
@@ -131,7 +137,11 @@
   let repeatPauses = 0;
   let resumeBackoffMs = 0;
   let ownHandleCache = '';
-  let hiddenWarned = false;
+  let hiddenAutoPaused = false; // auto-paused because the tab went to the background
+  let dryDone = false;   // a dry run has been completed at least once (persisted)
+  let unlikedUrls = [];  // URLs of successfully unliked videos (recovery list)
+  let uiPos = null;      // {x, y} panel position when the user has dragged it
+  let uiCollapsed = false;
 
   // The log used to be a single overwritten line, so a warning was readable for
   // a couple of seconds and then gone. Keep a capped, selectable scrollback.
@@ -197,27 +207,33 @@
     if (abortPending) abortPending();
   }
 
-  // Sleep with a live per-second countdown in the log. Aborts early if stopped.
+  // Sleep with a live per-second countdown. The ticks OVERWRITE a dedicated
+  // status line instead of appending to the log: a 3–7 minute break used to
+  // push 180–420 lines through the 40-line history and wipe the diagnostics
+  // right when Copy Log mattered. Aborts early if stopped.
   async function countdownSleep(ms, labelFn) {
     let remaining = Math.round(ms / 1000);
     while (remaining > 0 && running && !paused) {
-      log(labelFn(remaining));
+      setCountdown(labelFn(remaining));
       await sleep(1000);
       remaining--;
     }
+    setCountdown('');
   }
 
   // ---------------- Persistence ----------------
   // `activity` = this save follows real work (a video processed, a window
   // rolled, a run started). Idle saves — toggling dry run, editing the target —
-  // must NOT push `at` forward, or the 6h session window never expires.
+  // must NOT push `at` forward, or the 12h session window never expires.
   function save(activity) {
     if (activity) lastActivity = Date.now();
     writeStore({
       total,
       target,
       dryRun,
+      dryDone,
       handle: ownHandleCache,
+      ui: { x: uiPos ? uiPos.x : null, y: uiPos ? uiPos.y : null, collapsed: uiCollapsed },
       session: {
         unliked,
         processed,
@@ -226,6 +242,7 @@
         dryTotal,
         attempts,
         verifyFailsTotal,
+        urls: unlikedUrls.slice(-CFG.urlHistoryMax),
         num: session,
         at: lastActivity,
       },
@@ -236,8 +253,15 @@
     const s = readStore();
     total = Number(s.total) || 0;
     target = Number(s.target) || 0;
-    dryRun = !!s.dryRun;
+    dryDone = !!s.dryDone;
+    // Dry run defaults to ON until a dry run has actually been completed once:
+    // the first thing a first-time user's Start does must not be irreversible.
+    // An explicit stored choice (the user toggled the checkbox) always wins.
+    dryRun = s.dryRun === undefined ? !dryDone : !!s.dryRun;
     ownHandleCache = typeof s.handle === 'string' ? s.handle : '';
+    const ui = s.ui || {};
+    uiCollapsed = !!ui.collapsed;
+    if (typeof ui.x === 'number' && typeof ui.y === 'number') uiPos = { x: ui.x, y: ui.y };
     const sess = s.session;
     const at = sess ? Number(sess.at) || 0 : 0;
     if (sess && Date.now() - at < CFG.sessionIdleMs) {
@@ -248,6 +272,9 @@
       attempts = Number(sess.attempts) || 0;
       verifyFailsTotal = Number(sess.verifyFailsTotal) || 0;
       session = Number(sess.num) || 1;
+      unlikedUrls = Array.isArray(sess.urls)
+        ? sess.urls.filter((u) => typeof u === 'string').slice(-CFG.urlHistoryMax)
+        : [];
       // dryTotal lives behind the SAME expiry as runTotal — otherwise a dry run
       // that hit its target insta-"finishes" days later with nothing processed.
       dryTotal = Number(sess.dryTotal ?? s.dryTotal) || 0;
@@ -390,7 +417,7 @@
   // TikTok's DOM shifts often; try several strategies, most specific first.
   // No container => no button. There is deliberately NO document-wide fallback:
   // searching the whole page would let the script act on some other video (or
-  // another page entirely) instead of failing safe into the 3-strike pause.
+  // another page entirely) instead of failing safe into the 6-strike pause.
   function findLikeButton() {
     const root = activeContainer();
     if (!root) return null;
@@ -401,8 +428,12 @@
       const el = root.querySelector(sel);
       if (el) return el.closest('button') || el;
     }
+    // aria-label fallback, HARDENED: the desktop comment drawer renders inside
+    // the same video container, and its per-comment like buttons also carry a
+    // "Like"-ish aria-label. A button inside anything comment-flavoured is
+    // rejected outright — better to miss and pause than to unlike a comment.
     const el = root.querySelector('button[aria-label*="Like" i]');
-    if (el) return el;
+    if (el && !el.closest('[data-e2e*="comment"]')) return el;
     return null;
   }
 
@@ -415,17 +446,26 @@
     if (pressed === 'true') return true;
     if (pressed === 'false') return false;
 
-    // 2) aria-label wording ("Like video" vs "Unlike video" / "Liked")
-    const label = (btn.getAttribute('aria-label') || '').toLowerCase();
-    if (label.includes('unlike') || label.includes('liked')) return true;
-    if (label.startsWith('like')) return false;
+    // 2) aria-label wording ("Like video" vs "Unlike video" / "Liked").
+    // Order matters: the unliked forms ("Like…") are checked BEFORE any
+    // 'liked' substring test, because labels such as "Like video, liked by
+    // 1.2M" contain both, and 'liked' alone must never match social-proof
+    // copy like "liked by 1.2M".
+    const label = (btn.getAttribute('aria-label') || '').toLowerCase().trim();
+    if (/(^|[^a-z])unlike([^a-z]|$)/.test(label)) return true;
+    if (/^like\b/.test(label)) return false;
+    if (/(^|[^a-z])liked([^a-z]|$)/.test(label) && !/liked\s+by\b/.test(label)) return true;
 
-    // 3) SVG fill heuristic — liked heart is TikTok red (rgb(254,44,85) / #fe2c55)
+    // 3) SVG fill heuristic — anchored to TikTok's actual like red
+    // (#fe2c55 / rgb(254, 44, 85)). A loose 'rgba(254' match used to treat
+    // near-white fills like rgba(254,254,254) as "liked" and click LIKE on
+    // unliked videos.
     const svg = btn.querySelector('svg');
     if (svg) {
+      const RED = /(#?fe2c55\b|rgba?\(\s*254\s*,\s*44\s*,\s*85\s*[,)])/;
       const fills = [svg, ...svg.querySelectorAll('[fill]')]
         .map((n) => (n.getAttribute('fill') || '').toLowerCase());
-      if (fills.some((f) => f.includes('fe2c55') || f.includes('rgba(254'))) return true;
+      if (fills.some((f) => RED.test(f))) return true;
     }
     return null; // unknown — skip rather than guess
   }
@@ -439,8 +479,6 @@
   }
 
   // Find TikTok's "next video" chevron and click it.
-  // Synthetic ArrowDown keydowns are ignored (isTrusted check), but
-  // clicking the real button element works.
   // Anything destructive or share-y that must never be mistaken for "next".
   // WORD-BOUNDED, and only a veto when the allow pattern didn't match: as an
   // unbounded substring list it blocked legitimate next-buttons whose labels
@@ -496,15 +534,11 @@
   async function nextVideo() {
     const before = location.href;
     const btn = findNextButton();
-    if (btn) {
-      btn.click();
-    } else {
-      // last resort: try the keydown anyway
-      const ev = new KeyboardEvent('keydown', {
-        key: 'ArrowDown', code: 'ArrowDown', keyCode: 40, which: 40, bubbles: true,
-      });
-      document.body.dispatchEvent(ev);
-    }
+    // No candidate button: record the failure immediately. The old synthetic
+    // ArrowDown fallback was dead code — TikTok ignores untrusted keydowns —
+    // and its 5s navigation poll just slowed every miss down.
+    if (!btn) return false;
+    btn.click();
     // wait up to ~5s for navigation
     for (let i = 0; i < 10; i++) {
       await sleep(500);
@@ -524,8 +558,9 @@
       const b = resumeBackoffMs;
       resumeBackoffMs = 0;
       mode = 'break';
+      log(`Backoff — repeated pause, retrying in ${Math.round(b / 1000)}s.`);
       updateUI();
-      await countdownSleep(b, (s) => `Backoff ${s}s — repeated pause, retrying slowly.`);
+      await countdownSleep(b, (s) => `Backoff ${s}s — retrying slowly.`);
       if (!running || paused) return;
       mode = 'running';
       updateUI();
@@ -619,6 +654,10 @@
               unliked++;
               runTotal++;
               total++;
+              // Recovery list: an unlike is irreversible from here, so keep the
+              // URL so a mistaken run can be manually re-liked.
+              unlikedUrls.push(location.href);
+              if (unlikedUrls.length > CFG.urlHistoryMax) unlikedUrls.shift();
               log(`Unliked #${total}`);
             } else {
               verifyFailsTotal++;
@@ -721,7 +760,6 @@
       return;
     }
     clearStrikes();
-    hiddenWarned = false;
     paused = false;
     pauseReason = '';
     pauseCode = '';
@@ -733,7 +771,15 @@
     log(`Session ${session} — cap: ${sessionCap}, ${unliked} done. Keep this tab focused.`);
     save(true);
     updateUI();
-    loopPromise = loop();
+    // Serialize on the previous loop promise: a stop() immediately followed by
+    // start() could otherwise briefly have two loops interleaving on the same
+    // trackers. The old loop settles fast (its sleep is aborted), so this only
+    // ever waits a tick.
+    const prev = loopPromise;
+    loopPromise = (async () => {
+      if (prev) { try { await prev; } catch (e) { /* already surfaced */ } }
+      await loop();
+    })();
     return loopPromise;
   }
 
@@ -756,6 +802,10 @@
     pauseReason = '';
     pauseCode = '';
     mode = 'done';
+    // Completing a dry run flips the first-run default: from now on the
+    // dry-run checkbox follows the user's explicit choice instead of
+    // defaulting to on.
+    if (dryRun) dryDone = true;
     abortSleep();
     log(msg);
     save(false);
@@ -803,9 +853,11 @@
 
   function setDryRun(on) {
     dryRun = !!on;
+    if (typeof disarmStartHook === 'function') disarmStartHook(); // an armed confirm is stale once the mode changes
     save(false);   // idle toggle: must not extend the session window
     updateUI();
   }
+  let disarmStartHook = null;
 
   function setTarget(n) {
     target = Math.max(0, Number(n) || 0);
@@ -830,7 +882,7 @@
         --ttmu-txt: #f1e3e4;
         --ttmu-txtstrong: #ffffff;
         --ttmu-m1: #ccbcbc;
-        --ttmu-m7: #948a8e;
+        --ttmu-m7: #a69aa0;
         --ttmu-b1: #35363c;
         --ttmu-hair: rgba(241, 227, 228, .09);
         --ttmu-hairh: rgba(241, 227, 228, .16);
@@ -847,14 +899,28 @@
         font-variant-numeric: tabular-nums;
         -webkit-font-smoothing: antialiased;
         text-align: left;
+        animation: ttmu-rise .18s cubic-bezier(0.23, 1, 0.32, 1);
       }
+      @keyframes ttmu-rise { from { opacity: 0; transform: translateY(4px); } }
+      @keyframes ttmu-fade { from { opacity: 0; } }
       #ttmu-panel *, #ttmu-panel *::before, #ttmu-panel *::after { box-sizing: border-box; }
       #ttmu-panel h4 {
         margin: 0 0 10px; padding: 0 0 10px;
         border-bottom: 1px solid var(--ttmu-hair);
         font-size: 13px; font-weight: 700; letter-spacing: -.02em;
         color: var(--ttmu-txtstrong); font-family: inherit;
+        display: flex; align-items: center; justify-content: space-between;
+        cursor: move; user-select: none; -webkit-user-select: none;
       }
+      #ttmu-panel.collapsed h4 { margin: 0; padding: 0; border-bottom: none; }
+      #ttmu-panel.collapsed #ttmu-body { display: none; }
+      #ttmu-panel #ttmu-collapse {
+        width: auto; margin: 0; padding: 0 4px;
+        background: none; border: none; border-radius: 4px;
+        color: var(--ttmu-m7); font-size: 13px; font-weight: 600; line-height: 1;
+        cursor: pointer;
+      }
+      #ttmu-panel #ttmu-collapse:hover { color: var(--ttmu-txt); background: var(--ttmu-surface3); }
       #ttmu-panel .row {
         display: flex; align-items: baseline; justify-content: space-between;
         gap: 12px; padding: 3px 0;
@@ -890,12 +956,12 @@
       }
       #ttmu-panel input:focus-visible { outline: 2px solid var(--ttmu-ac); outline-offset: 2px; }
       #ttmu-panel #ttmu-status {
-        font-family: inherit; font-size: 10.5px; font-weight: 600; letter-spacing: .03em;
+        font-family: inherit; font-size: 11px; font-weight: 600; letter-spacing: .03em;
         padding: 2px 7px; border-radius: 6px;
         color: var(--ttmu-m1);
         background: var(--ttmu-surface3);
         border: 1px solid var(--ttmu-b1);
-        transition: color .15s, background-color .15s, border-color .15s;
+        transition: color .15s ease-out, background-color .15s ease-out, border-color .15s ease-out;
       }
       #ttmu-panel #ttmu-status.active {
         color: var(--ttmu-ac-pale);
@@ -908,26 +974,43 @@
         border-color: color-mix(in srgb, var(--ttmu-warn) 30%, transparent);
       }
       #ttmu-panel #ttmu-dry-chip {
-        font-family: inherit; font-size: 10.5px; font-weight: 600; letter-spacing: .03em;
+        font-family: inherit; font-size: 11px; font-weight: 600; letter-spacing: .03em;
         padding: 2px 7px; border-radius: 6px;
         color: var(--ttmu-ac-pale);
         background: color-mix(in srgb, var(--ttmu-ac) 18%, transparent);
         border: 1px dashed color-mix(in srgb, var(--ttmu-ac-soft) 45%, transparent);
       }
       #ttmu-panel .hidden { display: none; }
+      /* Elements that swap via .hidden fade in when they (re)appear instead of
+         snapping — the animation restarts each time display flips from none. */
+      #ttmu-panel #ttmu-dry-chip:not(.hidden),
+      #ttmu-panel #ttmu-countdown:not(.hidden),
+      #ttmu-panel #ttmu-resume:not(.hidden),
+      #ttmu-panel #ttmu-btn:not(.hidden) {
+        animation: ttmu-fade .15s cubic-bezier(0.23, 1, 0.32, 1);
+      }
       #ttmu-panel button {
         width: 100%; margin-top: 12px; padding: 8px 0;
         border: 1px solid var(--ttmu-ac); border-radius: 8px;
         font-family: inherit; font-size: 12px; font-weight: 600; letter-spacing: -.01em;
         cursor: pointer;
         background: var(--ttmu-ac); color: #1c1d21;
-        transition: color .15s, background-color .15s, border-color .15s;
+        transition: color .15s ease-out, background-color .15s ease-out, border-color .15s ease-out;
       }
       #ttmu-panel button:hover {
         background: var(--ttmu-ac2);
         border-color: var(--ttmu-ac2);
       }
-      #ttmu-panel button:active { transform: translateY(1px); }
+      #ttmu-panel button:active { transform: scale(0.97); }
+      /* Armed confirm state: visibly different, warns before the point of no return. */
+      #ttmu-panel button.confirm {
+        background: var(--ttmu-warn); border-color: var(--ttmu-warn); color: #1c1d21;
+      }
+      #ttmu-panel button.confirm.secondary {
+        background: color-mix(in srgb, var(--ttmu-warn) 16%, transparent);
+        border-color: color-mix(in srgb, var(--ttmu-warn) 40%, transparent);
+        color: var(--ttmu-warn);
+      }
       #ttmu-panel button:focus-visible { outline: 2px solid var(--ttmu-ac); outline-offset: 2px; }
       /* Secondary: only one solid-accent primary is ever visible at a time. */
       #ttmu-panel button.secondary {
@@ -953,12 +1036,24 @@
         user-select: text; -webkit-user-select: text;
       }
       #ttmu-log.warn { color: var(--ttmu-warn); }
+      #ttmu-countdown {
+        margin-top: 8px;
+        color: var(--ttmu-ac-pale); font-size: 11px;
+        font-variant-numeric: tabular-nums;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #ttmu-panel, #ttmu-panel * {
+          animation: none !important;
+          transition-duration: 0s !important;
+        }
+      }
     </style>
-    <h4>TikTok mass unliker</h4>
+    <h4 id="ttmu-head">TikTok mass unliker<button id="ttmu-collapse" title="Collapse panel" aria-label="Collapse panel">–</button></h4>
+    <div id="ttmu-body">
     <div class="row"><span>This session</span><b id="ttmu-run">0</b></div>
     <div class="row"><span>All time</span><b id="ttmu-total">0</b></div>
     <div class="row"><span>Window</span><b id="ttmu-count">–</b></div>
-    <div class="row"><span>Clicks ok / failed</span><b id="ttmu-verify">0 / 0</b></div>
+    <div class="row"><span>Verified / failed</span><b id="ttmu-verify">0 / 0</b></div>
     <div class="row"><span>Status</span><b id="ttmu-status">idle</b></div>
     <div class="row"><span>Mode</span><b id="ttmu-dry-chip" class="hidden">dry run</b></div>
     <div class="sep opt">
@@ -969,13 +1064,18 @@
       <label for="ttmu-target">Stop after</label>
       <input type="number" id="ttmu-target" min="0" step="10" placeholder="0">
     </div>
+    <div id="ttmu-countdown" class="hidden"></div>
     <button id="ttmu-resume" class="hidden">Resume</button>
     <button id="ttmu-btn">Start</button>
     <div class="btnrow">
       <button id="ttmu-reset" class="secondary">Reset counters</button>
       <button id="ttmu-copy" class="secondary">Copy log</button>
     </div>
+    <div class="btnrow">
+      <button id="ttmu-copyurls" class="secondary">Copy unliked list</button>
+    </div>
     <div id="ttmu-log"></div>
+    </div>
   `;
   document.body.appendChild(panel);
 
@@ -983,22 +1083,100 @@
 
   load();
 
+  // ---- Panel position / collapse (persisted) ----
+  function applyUiPos() {
+    if (uiPos && panel.style) {
+      panel.style.left = uiPos.x + 'px';
+      panel.style.top = uiPos.y + 'px';
+      panel.style.right = 'auto';
+      panel.style.bottom = 'auto';
+    }
+    panel.classList.toggle('collapsed', uiCollapsed);
+  }
+  applyUiPos();
+
+  let dragOff = null;
+  $('#ttmu-head').addEventListener('mousedown', (e) => {
+    if (e.target && e.target.id === 'ttmu-collapse') return;
+    const r = panel.getBoundingClientRect();
+    dragOff = { x: (e.clientX || 0) - r.left, y: (e.clientY || 0) - r.top };
+    if (e.preventDefault) e.preventDefault();
+  });
+  document.addEventListener('mousemove', (e) => {
+    if (!dragOff) return;
+    uiPos = {
+      x: Math.max(0, (e.clientX || 0) - dragOff.x),
+      y: Math.max(0, (e.clientY || 0) - dragOff.y),
+    };
+    applyUiPos();
+  });
+  document.addEventListener('mouseup', () => {
+    if (dragOff) { dragOff = null; save(false); }
+  });
+  $('#ttmu-collapse').addEventListener('click', () => {
+    uiCollapsed = !uiCollapsed;
+    applyUiPos();
+    save(false);
+  });
+
+  // ---- Two-step confirmation ----
+  // A real run permanently unlikes videos, so a single stray click must not
+  // start one: the first click ARMS the button for a few seconds, the second
+  // click starts. Dry runs start on a single click. Reset gets the same
+  // pattern — it wipes the session counters.
+  let startArmed = false;
+  let startArmTimer = 0;
+  let resetArmed = false;
+  let resetArmTimer = 0;
+
+  function disarmStart() {
+    startArmed = false;
+    if (startArmTimer) { clearTimeout(startArmTimer); startArmTimer = 0; }
+  }
+  disarmStartHook = disarmStart;
+
   $('#ttmu-btn').addEventListener('click', () => {
-    if (running) stop('Stopped.');
-    else start();
+    if (running) { disarmStart(); stop('Stopped.'); return; }
+    if (!dryRun && !startArmed) {
+      startArmed = true;
+      if (startArmTimer) clearTimeout(startArmTimer);
+      startArmTimer = setTimeout(() => { disarmStart(); updateUI(); }, CFG.confirmArmMs);
+      updateUI();
+      return;
+    }
+    disarmStart();
+    start();
   });
   $('#ttmu-resume').addEventListener('click', () => resume());
-  $('#ttmu-reset').addEventListener('click', () => resetCounters());
+  $('#ttmu-reset').addEventListener('click', () => {
+    if (!resetArmed) {
+      resetArmed = true;
+      if (resetArmTimer) clearTimeout(resetArmTimer);
+      resetArmTimer = setTimeout(() => { resetArmed = false; updateUI(); }, CFG.confirmArmMs);
+      updateUI();
+      return;
+    }
+    resetArmed = false;
+    if (resetArmTimer) { clearTimeout(resetArmTimer); resetArmTimer = 0; }
+    resetCounters();
+  });
   $('#ttmu-copy').addEventListener('click', () => copyLog());
+  $('#ttmu-copyurls').addEventListener('click', () => copyUnliked());
 
-  // The README tells you to keep the tab focused; nothing used to check. A
-  // background tab gets its timers throttled, so pacing quietly falls apart.
+  // A background tab gets its timers throttled, which distorts all pacing and
+  // can trip the nav-failure tracking on phantom timeouts. Instead of merely
+  // warning, auto-pause and resume when the tab is visible again.
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden && running && !hiddenWarned) {
-      hiddenWarned = true;
-      log('Tab is in the background — browsers throttle background timers, so pacing will drift. Bring this tab back to the front.');
-    } else if (!document.hidden) {
-      hiddenWarned = false;
+    if (document.hidden && running) {
+      hiddenAutoPaused = true;
+      pause(P.HIDDEN, 'Tab went to the background — browsers throttle background timers, so the run is auto-paused. It resumes when the tab is visible again.');
+    } else if (!document.hidden && hiddenAutoPaused && paused && pauseCode === P.HIDDEN) {
+      hiddenAutoPaused = false;
+      // Tab switches are not a fault: don't let them burn the escalation budget.
+      lastPauseCode = '';
+      repeatPauses = 0;
+      log('Tab visible again — resuming.');
+      start();
     }
   });
   $('#ttmu-dry').addEventListener('change', (e) => setDryRun(e.target.checked));
@@ -1032,8 +1210,16 @@
     if (!focused) tgt.value = target ? String(target) : '';
 
     const btn = $('#ttmu-btn');
-    btn.textContent = running ? 'Stop' : 'Start';
+    const armed = startArmed && !running && !dryRun;
+    btn.textContent = running
+      ? 'Stop'
+      : (armed ? 'Confirm — permanently unlikes' : 'Start');
+    btn.classList.toggle('confirm', armed);
     btn.classList.toggle('secondary', running);
+
+    const rst = $('#ttmu-reset');
+    rst.textContent = resetArmed ? 'Confirm reset' : 'Reset counters';
+    rst.classList.toggle('confirm', resetArmed);
     // While paused, Resume is the single primary action — a second identical
     // "Start" button beside it does the same thing and just adds doubt.
     btn.classList.toggle('hidden', paused);
@@ -1047,6 +1233,14 @@
     return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
   }
 
+  // The countdown OVERWRITES this one line; it never touches the log history.
+  function setCountdown(text) {
+    const el = $('#ttmu-countdown');
+    if (!el) return;
+    el.textContent = text || '';
+    el.classList.toggle('hidden', !text);
+  }
+
   function log(msg) {
     logHist.push(`${stamp()}  ${msg}`);
     while (logHist.length > CFG.logHistory) logHist.shift();
@@ -1058,17 +1252,45 @@
     console.log('[TTMU]', msg);
   }
 
-  function copyLog() {
-    const text = logHist.join('\n');
+  // AWAITS the clipboard promise before claiming success — writeText can
+  // reject (permissions, unfocused document) after the old version had already
+  // logged "copied". Falls back to a hidden textarea + execCommand, then to
+  // printing to the console.
+  async function copyText(text, what) {
     try {
       if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text);
-        log('Log copied to the clipboard.');
+        await navigator.clipboard.writeText(text);
+        log(`${what} copied to the clipboard.`);
         return;
       }
-    } catch (e) { /* fall through */ }
-    console.log('[TTMU] log:\n' + text);
-    log('Clipboard unavailable — the log was printed to the console instead.');
+    } catch (e) { /* fall through to the legacy path */ }
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      if (ta.style) { ta.style.position = 'fixed'; ta.style.opacity = '0'; }
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand && document.execCommand('copy');
+      ta.remove();
+      if (ok) { log(`${what} copied to the clipboard (fallback).`); return; }
+    } catch (e) { /* fall through to the console */ }
+    console.log(`[TTMU] ${what}:\n` + text);
+    log(`Clipboard unavailable — ${what.toLowerCase()} was printed to the console instead (F12 to open it).`);
+  }
+
+  function copyLog() {
+    return copyText(logHist.join('\n'), 'Log');
+  }
+
+  // Recovery export: every verified unlike's URL, one per line, so a mistaken
+  // run can be manually re-liked.
+  function copyUnliked() {
+    if (!unlikedUrls.length) {
+      log('No unliked video URLs recorded this session.');
+      return;
+    }
+    return copyText(unlikedUrls.join('\n'), `Unliked list (${unlikedUrls.length} URLs)`);
   }
 
   updateUI();
@@ -1084,12 +1306,14 @@
   window.__TTMU__ = {
     CFG, P,
     start, stop, resume, pause, setDryRun, setTarget, resetCounters,
-    findNextButton, findLikeButton, pageGuard, ownHandle,
+    findNextButton, findLikeButton, isLiked, pageGuard, ownHandle,
+    copyLog, copyUnliked,
+    unlikedUrls: () => unlikedUrls.slice(),
     get panel() { return panel; },
     get loopPromise() { return loopPromise; },
     logHistory: () => logHist.slice(),
     state: () => ({
-      running, paused, pauseCode, pauseReason, mode, dryRun, target,
+      running, paused, pauseCode, pauseReason, mode, dryRun, dryDone, target,
       unliked, processed, runTotal, dryTotal, total, session, sessionCap,
       repeatPauses, attempts, verifyFailsTotal, lastNextMiss,
       verifyFails: failCount(verifyTrk), verifyStreak: verifyTrk.streak,

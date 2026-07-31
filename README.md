@@ -12,12 +12,16 @@ A Chrome extension / userscript that gradually unlikes videos while you browse y
 - **Determinacy guard** — if the like state becomes unreadable (a DOM change), the script pauses and says so. It used to keep looping and unlike nothing for hours with the panel still reading "running"
 - **Container-scoped selectors** — every lookup is scoped to the active video container, chosen by how much of the viewport it covers so a stale off-screen container can't win. If no container is on the page, the script finds nothing and pauses rather than clicking something on another part of the page
 - **Verified clicks, rate guard + hard ceiling** — after each click the state is re-read. The script pauses on 2 consecutive failures, 3 failures in the last 10 verifications, *or* 10 failed verifications in total for the run — see [What the guards actually bound](#what-the-guards-actually-bound)
-- **Dry run** — counts what it *would* unlike without clicking the like button
+- **Two-step Start** — a real run permanently unlikes videos, so one stray click can't begin one: the first click arms the button ("Confirm — permanently unlikes") for 5 seconds, the second starts. Dry runs start on a single click
+- **Dry run, on by default on the first run** — counts what it *would* unlike without clicking the like button. Until a dry run has been completed once, the checkbox starts ticked, so the very first **Start** a new user presses is a rehearsal
+- **Unliked-URL export** — every *verified* unlike is recorded, and **Copy unliked list** hands back one URL per line, so a run you regret can be manually re-liked
+- **Auto-pause in a background tab** — browsers throttle background timers, which distorts the pacing and can trip the navigation guard on phantom timeouts. The run pauses when the tab is hidden and resumes when it is visible again, without spending the escalation budget
 - **Target count** — "Stop after N", counted across reloads within the session window
-- **Persistence** — counts, target, dry-run flag, and the current session survive a reload
+- **Persistence** — counts, target, dry-run flag, panel position/collapse, and the current session survive a reload
 - **Paused state with escalating backoff** — anomalies pause the script rather than stopping it; **Resume** picks up where it left off, but repeating the same *kind* of pause earns an increasing cooldown and eventually a refusal
-- **Readable log** — the panel keeps the last 40 log lines with a **Copy log** button, instead of one line that overwrites itself before you can read it
-- **Reset counters** — a button that clears the session, run, and dry-run counters (lifetime total is kept)
+- **Readable log** — the panel keeps the last 40 log lines with a **Copy log** button, instead of one line that overwrites itself before you can read it. Break and backoff countdowns tick on their own status line, so a 7-minute break can't push 420 lines through the history and wipe the diagnostics
+- **Reset counters** — a confirm-armed button that clears the session, run, and dry-run counters (lifetime total is kept)
+- **Movable panel** — drag it by its title bar, collapse it with the **–** button; both are remembered
 
 ## Installation
 
@@ -38,8 +42,8 @@ The same script runs as a content script; state is kept in the site's `localStor
 
 1. Go to your TikTok profile and open the **Liked** tab
 2. Click the first video to enter the video viewer
-3. Press **Start** on the panel in the bottom-right corner
-4. Keep the tab open and focused; press **Stop** at any time
+3. Press **Start** on the panel in the bottom-right corner. On a real run the first press only *arms* the button — press the amber **Confirm — permanently unlikes** within 5 seconds to actually begin
+4. Keep the tab open and focused; press **Stop** at any time. Switching away pauses the run rather than letting a throttled tab distort the pacing
 
 The panel says `Ready` only when the page guard is satisfied. If it says `Not ready`, it tells you what is wrong — you are on For You, on someone else's profile, or the Liked tab isn't the selected one. Pressing **Start** there does nothing on purpose.
 
@@ -60,18 +64,19 @@ It runs before **Start** *and* on every loop iteration, so an autoplay, a back b
 | **This session** | Real (or would-be, in a dry run) unlikes since the session started |
 | **All time** | Lifetime unlikes; never expires |
 | **Window** | Progress through the current cap window, and videos seen in it |
-| **Clicks ok / failed** | Verified unlikes vs clicks that did *not* flip the like state. The second number is the one that matters — it turns amber as soon as it is non-zero |
+| **Verified / failed** | Verified unlikes vs clicks that did *not* flip the like state. The second number is the one that matters — it turns amber as soon as it is non-zero |
 | **Status** | `idle`, `running`, `break`, `paused` or `done` |
 
 ### Panel controls
 
 | Control | What it does |
 | --- | --- |
-| **Start / Stop** | Runs or halts the loop. Hidden while paused. |
+| **Start / Stop** | Runs or halts the loop. Hidden while paused. On a real run, Start is confirm-armed: click once to arm, again within 5s to begin. Toggling **Dry run** disarms it. |
 | **Resume** | Only shown when the script paused itself. Clears the rolling strike counters and continues — but not the cumulative failure ceiling. |
-| **Reset counters** | Clears session, run, dry-run and failed-verification counters and any paused state. Lifetime total is kept. |
-| **Copy log** | Copies the panel's log scrollback to the clipboard (falls back to the console). |
-| **Dry run** | Counts would-be unlikes without clicking the like button. |
+| **Reset counters** | Clears session, run, dry-run and failed-verification counters and any paused state. Lifetime total is kept. Confirm-armed, like Start. |
+| **Copy log** | Copies the panel's log scrollback to the clipboard. Success is only reported once the write actually settles; it falls back to a hidden textarea, then to the console. |
+| **Copy unliked list** | Copies the URL of every verified unlike this session, one per line — the manual recovery path. |
+| **Dry run** | Counts would-be unlikes without clicking the like button. Ticked by default until you have completed one dry run. |
 | **Stop after** | Target count, `0` = no target. Leave the field focused while typing — the panel won't overwrite it. |
 
 ### Dry run
@@ -86,7 +91,7 @@ The dry-run count (`dryTotal`) lives inside the same 12-hour session window as t
 
 ### Persistence and the session window
 
-State is stored under `ttmu.v1` via `GM_setValue` (or `localStorage` as a fallback): lifetime total, target, dry-run flag, your cached profile handle, and the current session (unliked, processed, cap, run total, dry total, clicks attempted, failed verifications, session number, last-activity timestamp).
+State is stored under `ttmu.v1` via `GM_setValue` (or `localStorage` as a fallback): lifetime total, target, dry-run flag, the "a dry run has been completed" flag behind the first-run default, panel position and collapse state, your cached profile handle, and the current session (unliked, processed, cap, run total, dry total, clicks attempted, failed verifications, session number, last-activity timestamp, and the unliked-URL recovery list, capped at 2000).
 
 The session expires **12 hours after the last real activity**. It used to be 6, which was shorter than a measured full run (4–6 hours), so a long job could have its own counters expire underneath it. Expiry is now logged loudly instead of silently zeroing the session.
 
@@ -105,12 +110,15 @@ Only real work — processing a video, rolling a new cap window, starting a run 
 | `verify-ceiling` | 10 failed verifications in this run, however spread out |
 | `nav-streak` / `nav-window` | can't advance past the same video |
 | `nav-labels` | no button matched a next-video label — usually a non-English TikTok UI |
+| `hidden-tab` | the tab went to the background; it resumes by itself when the tab is visible again |
 
 Resume is not free. If the script pauses repeatedly for the same *code* it waits before retrying — 30s, then 60s, then 120s, capped at 5 minutes — and after the fifth pause with that code it refuses to resume and asks you to fix the page or reset the counters. The escalation used to key on the message text, which embeds live counters ("3 of the last 5…", "3 of the last 7…"): three different failure patterns produced three different sentences, reset the counter to 1 every time, and disarmed both the backoff and the refusal.
 
 ## How it works
 
-The script finds the active video container first (`data-e2e="browse-video"` and friends), then looks for the like button *inside it* using TikTok's `data-e2e` attributes with an `aria-label` fallback. There is deliberately no document-wide fallback: no container means no button, which means the strike pause fires (6 strikes, ~39s of patience for a slow load) with an accurate message rather than the script quietly operating on some other element.
+The script finds the active video container first (`data-e2e="browse-video"` and friends), then looks for the like button *inside it* using TikTok's `data-e2e` attributes with an `aria-label` fallback. That fallback rejects any button inside a comment container: on desktop the comment drawer renders *inside* the same video container and its per-comment like buttons carry a "Like"-ish label, so an unqualified `aria-label*="Like"` match could unlike a comment. There is deliberately no document-wide fallback: no container means no button, which means the strike pause fires (6 strikes, ~39s of patience for a slow load) with an accurate message rather than the script quietly operating on some other element.
+
+The like state itself is read in strict order: `aria-pressed` first, then label wording — the *unliked* forms are tested before any `liked` substring, so "Like video, liked by 1.2M" reads as unliked and social-proof copy can never masquerade as a liked state — and only then the icon fill, anchored to TikTok's actual like red (`#fe2c55` / `rgb(254, 44, 85)`) rather than a loose `rgba(254` match that treated near-white fills as liked and clicked *like* on unliked videos.
 
 It confirms the video is currently liked, clicks, waits 300–500ms, re-reads the state, and only counts the unlike if the state actually flipped. Failures feed a rolling window of the last 10 verifications *and* a cumulative per-run counter.
 
@@ -154,8 +162,9 @@ This script automates interactions with your own account and only removes your o
 - Desktop web layout only (tiktok.com in a desktop browser)
 - **English UI only** — the next-video button is matched on English `aria-label` text. On another language the run pauses with the `nav-labels` code and says so
 - If TikTok changes its DOM structure, the selectors may need updating — the script skips or pauses rather than guessing when unsure
-- The tab must remain open and in the foreground: background tabs get their timers throttled, so pacing drifts. The panel warns when the tab is hidden, but it cannot prevent it
+- The tab must remain open and in the foreground: background tabs get their timers throttled, so pacing drifts. The script auto-pauses when the tab is hidden and resumes when it comes back, so a backgrounded tab costs you time rather than accuracy
 - Verification is only as good as the DOM. If TikTok reports a stale like state, the guards bound the damage to **10 mistaken clicks per run** (see [What the guards actually bound](#what-the-guards-actually-bound)) — not zero, and not "about 3"
+- **Unliking is irreversible from the script's side.** The recovery path is manual: **Copy unliked list** gives you every verified unlike's URL so you can re-like them by hand. The list is capped at 2000 URLs and lives in the same session window as the counters
 - The page guard identifies your account from your own profile link on the page. If TikTok stops rendering it and no handle has been cached yet, the script refuses to start rather than guessing
 
 ## Tests
@@ -164,7 +173,7 @@ This script automates interactions with your own account and only removes your o
 node test.js
 ```
 
-No dependencies, no test runner, no network. It evaluates the real `tiktok-mass-unliker.user.js` in a `vm` context against a hand-rolled DOM, a virtual clock and seeded RNGs, prints a pass/fail line per test, and exits non-zero on failure. It covers the page guard, the determinacy guard, pause-code escalation, the cumulative ceiling, the next-button deny/allow rules, and a regression guard asserting the windowed failure tracker still trips at 2/5/10/20% failure rates. Every number in this README is produced by that harness.
+No dependencies, no test runner, no network. It evaluates the real `tiktok-mass-unliker.user.js` in a `vm` context against a hand-rolled DOM, a virtual clock and seeded RNGs, prints a pass/fail line per test, and exits non-zero on failure. It covers the page guard, the determinacy guard, pause-code escalation, the cumulative ceiling, the next-button deny/allow rules, the two-click confirm-arm on Start and Reset, the first-run dry-run default, adversarial like-state input (`"Like video, liked by 1.2M"`, near-white `rgba(254,254,254)` fills, a comment drawer's like button), the non-flooding countdown, the unliked-URL recovery list, every tier of the clipboard fallback, and a regression guard asserting the windowed failure tracker still trips at 2/5/10/20% failure rates. Every number in this README is produced by that harness.
 
 ## Contributing
 
