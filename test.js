@@ -159,6 +159,15 @@ class El {
     return null;
   }
   getBoundingClientRect() { return this.rect; }
+  // Used by the clipboard textarea fallback.
+  select() { this.selected = true; }
+  remove() {
+    if (this.parentNode) {
+      const i = this.parentNode.childNodes.indexOf(this);
+      if (i >= 0) this.parentNode.childNodes.splice(i, 1);
+      this.parentNode = null;
+    }
+  }
   addEventListener(t, fn) { (this._listeners[t] = this._listeners[t] || []).push(fn); }
   dispatchEvent(ev) {
     let n = this;
@@ -194,6 +203,9 @@ function makeDocument() {
   const doc = {
     hidden: false,
     activeElement: null,
+    // Null by default: the userscript's clipboard fallback is written to cope
+    // with execCommand being absent. Tests set it to exercise that tier.
+    execCommand: null,
     _listeners: Object.create(null),
     createElement(tag) { return new El(doc, tag); },
     addEventListener(t, fn) { (doc._listeners[t] = doc._listeners[t] || []).push(fn); },
@@ -269,7 +281,12 @@ function seededRandom(seed) {
  *   nextHook      false to drop the data-e2e hook and rely on label matching
  *   onNext        (i, env) => void, called after each successful advance
  *   random        () => number, seeded RNG for the script
+ *   firstRun      true = start from a virgin store, so the script's own
+ *                 dry-run-by-default first-run behaviour applies
+ *   seed          object merged into the persisted store before the script runs
+ *   clipboard     'ok' | 'reject' | 'none' — navigator.clipboard behaviour
  */
+const STORE_KEY = 'ttmu.v1';
 function makeEnv(opts) {
   const o = Object.assign({
     href: 'https://www.tiktok.com/@me/video/1',
@@ -281,6 +298,9 @@ function makeEnv(opts) {
     nextHook: true,
     onNext: null,
     random: seededRandom(1),
+    firstRun: false,
+    seed: null,
+    clipboard: 'ok',
   }, opts || {});
 
   const doc = makeDocument();
@@ -359,11 +379,31 @@ function makeEnv(opts) {
   };
 
   const store = new Map();
+  env.store = store;
+  // Unless a test asks for a virgin profile, pre-seed the store as an
+  // experienced user: a dry run has been done and the checkbox is off. The
+  // script's own first-run default (dry run ON) is covered by its own tests.
+  const seed = o.firstRun
+    ? o.seed
+    : Object.assign({ dryDone: true, dryRun: false }, o.seed || {});
+  if (seed) store.set(STORE_KEY, JSON.stringify(seed));
+
+  env.copied = [];
+  const clipboard = o.clipboard === 'none'
+    ? undefined
+    : {
+      writeText: (t) => {
+        if (o.clipboard === 'reject') return Promise.reject(new Error('denied'));
+        env.copied.push(String(t));
+        return Promise.resolve();
+      },
+    };
+
   const sandbox = {
     console: { log() {} },
     location,
     document: doc,
-    navigator: { clipboard: { writeText() {} } },
+    navigator: { clipboard },
     innerWidth: 1920,
     innerHeight: 1080,
     localStorage: {
@@ -389,6 +429,9 @@ function makeEnv(opts) {
   env.state = () => env.api.state();
   env.logText = () => env.api.panel.querySelector('#ttmu-log').textContent;
   env.panelText = (id) => env.api.panel.querySelector(id).textContent;
+  env.press = (id) => env.api.panel.querySelector(id).click();
+  env.hasClass = (id, c) => env.api.panel.querySelector(id).classList.contains(c);
+  env.logLines = () => env.logText().split('\n').filter(Boolean).length;
   return env;
 }
 
@@ -621,14 +664,281 @@ test('a non-English UI is reported as such, not as "end of feed"', async () => {
   includes(env.logText(), 'English', 'says the label language is the problem');
 });
 
-test('a hidden tab produces a warning', async () => {
+test('a hidden tab auto-pauses the run instead of merely warning', async () => {
   const env = makeEnv({});
   env.api.start();
   await env.clock.advanceUntil(() => env.state().runTotal >= 2, 60 * 60000);
   env.doc.hidden = true;
   env.doc.fire('visibilitychange');
-  env.api.stop();
+  const s = env.state();
+  eq(s.running, false, 'must stop running while hidden');
+  eq(s.paused, true, 'must be paused, not stopped');
+  eq(s.pauseCode, env.api.P.HIDDEN, 'dedicated pause code');
   includes(env.logText(), 'background', 'warns about background throttling');
+  const before = env.clicks;
+  await env.clock.advanceUntil(null, 5 * 60000);
+  eq(env.clicks, before, 'nothing is clicked while the tab is hidden');
+  env.api.stop();
+});
+
+test('becoming visible again resumes without burning the escalation budget', async () => {
+  const env = makeEnv({});
+  env.api.start();
+  await env.clock.advanceUntil(() => env.state().runTotal >= 2, 60 * 60000);
+  env.doc.hidden = true;
+  env.doc.fire('visibilitychange');
+  env.doc.hidden = false;
+  env.doc.fire('visibilitychange');
+  eq(env.state().running, true, 'must resume when visible again');
+  eq(env.state().repeatPauses, 0, 'a tab switch must not count as a fault');
+  includes(env.logText(), 'Tab visible again', 'says it resumed');
+  env.api.stop();
+});
+
+// -------------------------------------------------- isLiked: adversarial input
+// A wrong `true` here is the worst outcome in the whole script: it makes the
+// loop CLICK an unliked video, i.e. like something the user never liked.
+function bareButton(env, attrs, fills) {
+  const btn = env.doc.createElement('button');
+  for (const k of Object.keys(attrs || {})) btn.setAttribute(k, attrs[k]);
+  if (fills) {
+    const svg = env.doc.createElement('svg');
+    for (const f of fills) {
+      const p = env.doc.createElement('path');
+      p.setAttribute('fill', f);
+      svg.appendChild(p);
+    }
+    btn.appendChild(svg);
+  }
+  return btn;
+}
+
+test('aria-label wording is read in the right order ("liked by 1.2M" cannot lie)', async () => {
+  const env = makeEnv({});
+  const cases = [
+    ['Unlike video', true],
+    ['unlike', true],
+    ['Liked', true],
+    ['Like video', false],
+    ['like', false],
+    // The dangerous one: contains BOTH "like" and "liked". Social-proof copy
+    // must never be read as "this video is liked".
+    ['Like video, liked by 1.2M', false],
+    ['Like, liked by 340 people', false],
+    // Pure social proof with no verb form: unreadable, not "liked".
+    ['liked by 1.2M', null],
+    ['', null],
+  ];
+  for (const [label, want] of cases) {
+    const btn = bareButton(env, { 'aria-label': label });
+    eq(env.api.isLiked(btn), want, `aria-label ${JSON.stringify(label)}`);
+  }
+});
+
+test('aria-pressed still wins over any label wording', async () => {
+  const env = makeEnv({});
+  eq(env.api.isLiked(bareButton(env, { 'aria-pressed': 'false', 'aria-label': 'Unlike video' })), false, 'pressed=false');
+  eq(env.api.isLiked(bareButton(env, { 'aria-pressed': 'true', 'aria-label': 'Like video' })), true, 'pressed=true');
+});
+
+test('the SVG fill heuristic is anchored to the TikTok like red, not to "rgba(254"', async () => {
+  const env = makeEnv({});
+  const liked = ['#fe2c55', 'FE2C55', 'rgb(254, 44, 85)', 'rgba(254, 44, 85, 1)', 'rgba(254,44,85,.9)'];
+  for (const f of liked) {
+    eq(env.api.isLiked(bareButton(env, {}, [f])), true, `should read as liked: ${f}`);
+  }
+  // Near-white and other 254-leading fills used to match `includes('rgba(254')`
+  // and made the script click LIKE on unliked videos.
+  const notLiked = ['rgba(254, 254, 254, 1)', 'rgb(254, 254, 254)', '#fefefe', 'rgba(254, 255, 255, .5)',
+    'currentColor', 'none', '#fff', 'rgba(255, 44, 85, 1)'];
+  for (const f of notLiked) {
+    eq(env.api.isLiked(bareButton(env, {}, [f])), null, `must NOT read as liked: ${f}`);
+  }
+});
+
+// ------------------------------------------- aria-label fallback vs. comments
+test('the aria-label fallback rejects a like button inside a comment container', async () => {
+  const env = makeEnv({});
+  // Drop the data-e2e hook so only the aria-label fallback is left, then put a
+  // comment drawer inside the SAME video container — which is what desktop does.
+  env.likeBtn.childNodes = [];
+  env.likeBtn.removeAttribute('aria-label');
+  const drawer = env.doc.createElement('div');
+  drawer.setAttribute('data-e2e', 'comment-list');
+  const commentLike = env.doc.createElement('button');
+  commentLike.setAttribute('aria-label', 'Like this comment');
+  drawer.appendChild(commentLike);
+  env.container.appendChild(drawer);
+  const found = env.api.findLikeButton();
+  ok(found !== commentLike, "must never hand back a comment's like button");
+  eq(found, null, 'with no video like button it must fail closed, not fall back');
+});
+
+test('the aria-label fallback still finds a real video like button', async () => {
+  const env = makeEnv({});
+  env.likeBtn.childNodes = [];   // remove the data-e2e icon
+  env.likeBtn.setAttribute('aria-label', 'Like video');
+  const drawer = env.doc.createElement('div');
+  drawer.setAttribute('data-e2e', 'comment-list');
+  const commentLike = env.doc.createElement('button');
+  commentLike.setAttribute('aria-label', 'Like this comment');
+  drawer.appendChild(commentLike);
+  env.container.appendChild(drawer);
+  eq(env.api.findLikeButton(), env.likeBtn, 'the video like button must still be found');
+});
+
+// -------------------------------------------------- confirm-arm on a real run
+test('a real run needs two clicks: the first only arms the button', async () => {
+  const env = makeEnv({});
+  eq(env.state().dryRun, false, 'this env is a real run');
+  env.press('#ttmu-btn');
+  eq(env.state().running, false, 'the first click must NOT start an irreversible run');
+  includes(env.panelText('#ttmu-btn'), 'Confirm', 'the button says what the next click does');
+  ok(env.hasClass('#ttmu-btn', 'confirm'), 'armed state is visually distinct');
+  env.press('#ttmu-btn');
+  eq(env.state().running, true, 'the second click starts');
+  env.api.stop();
+});
+
+test('the armed confirm expires on its own', async () => {
+  const env = makeEnv({});
+  env.press('#ttmu-btn');
+  ok(env.hasClass('#ttmu-btn', 'confirm'), 'armed');
+  await env.clock.advanceUntil(null, env.api.CFG.confirmArmMs + 1000);
+  eq(env.state().running, false, 'still not running');
+  eq(env.panelText('#ttmu-btn'), 'Start', 'reverts to Start once the arm window lapses');
+  ok(!env.hasClass('#ttmu-btn', 'confirm'), 'disarmed');
+  // And a click after the lapse re-arms rather than starting.
+  env.press('#ttmu-btn');
+  eq(env.state().running, false, 'a late click must re-arm, not start');
+});
+
+test('switching to dry run disarms a pending confirm', async () => {
+  const env = makeEnv({});
+  env.press('#ttmu-btn');
+  ok(env.hasClass('#ttmu-btn', 'confirm'), 'armed');
+  env.api.setDryRun(true);
+  ok(!env.hasClass('#ttmu-btn', 'confirm'), 'an armed confirm is stale once the mode changes');
+});
+
+test('a dry run starts on a single click', async () => {
+  const env = makeEnv({});
+  env.api.setDryRun(true);
+  env.press('#ttmu-btn');
+  eq(env.state().running, true, 'nothing irreversible happens in a dry run');
+  eq(env.clicks, 0, 'and no like button is clicked');
+  env.api.stop();
+});
+
+test('Reset counters is confirm-armed too', async () => {
+  const env = makeEnv({});
+  env.api.setTarget(40);
+  env.press('#ttmu-reset');
+  eq(env.state().target, 40, 'the first click must not reset anything');
+  includes(env.panelText('#ttmu-reset'), 'Confirm', 'asks for confirmation');
+  env.press('#ttmu-reset');
+  includes(env.logText(), 'Counters reset', 'the second click resets');
+  eq(env.state().runTotal, 0, 'counters cleared');
+});
+
+// ------------------------------------------------- dry-run-by-default (first run)
+test('a first-ever run defaults to dry run', async () => {
+  const env = makeEnv({ firstRun: true });
+  eq(env.state().dryRun, true, 'the first thing Start does must not be irreversible');
+  eq(env.state().dryDone, false, 'no dry run has been completed yet');
+  eq(env.api.panel.querySelector('#ttmu-dry').checked, true, 'and the checkbox shows it');
+});
+
+test('the dry-run default lapses once a dry run has been completed', async () => {
+  const env = makeEnv({ firstRun: true, seed: { dryDone: true } });
+  eq(env.state().dryRun, false, 'an experienced user gets the normal default');
+});
+
+test('an explicit stored choice beats the first-run default', async () => {
+  const env = makeEnv({ firstRun: true, seed: { dryRun: false } });
+  eq(env.state().dryRun, false, 'the user unticked it — respect that');
+});
+
+test('finishing a dry run persists the dryDone flag', async () => {
+  const env = makeEnv({ firstRun: true });
+  env.api.setTarget(3);
+  env.press('#ttmu-btn');           // dry run: single click
+  await runUntilStopped(env, 60 * 60000);
+  eq(env.state().dryTotal >= 3, true, 'the dry run reached its target');
+  eq(env.state().dryDone, true, 'the flag flips');
+  includes(env.store.get('ttmu.v1'), '"dryDone":true', 'and is persisted');
+  eq(env.clicks, 0, 'a dry run never clicks');
+});
+
+// ------------------------------------------------ countdown must not flood the log
+test('the countdown overwrites one status line instead of flooding the log', async () => {
+  const env = makeEnv({});
+  const code = env.api.P.VERIFY_WINDOW;
+  env.api.pause(code, 'x');
+  env.api.pause(code, 'x');        // second identical pause earns a backoff
+  env.api.resume();
+  await env.clock.advanceUntil(
+    () => String(env.panelText('#ttmu-countdown')).indexOf('Backoff') !== -1, 5000);
+  const line = env.panelText('#ttmu-countdown');
+  includes(line, 'Backoff', 'the countdown renders on its own line');
+  const before = env.logLines();
+  await env.clock.advanceUntil(null, 20000);
+  const after = env.logLines();
+  ok(after - before <= 1, `20 countdown ticks added ${after - before} log lines`);
+  ok(env.panelText('#ttmu-countdown') !== line, 'but the countdown line itself ticks down');
+  env.api.stop();
+});
+
+// --------------------------------------------------- unliked-URL recovery list
+test('every verified unlike is recorded for recovery and can be copied', async () => {
+  const env = makeEnv({});
+  env.api.start();
+  await env.clock.advanceUntil(() => env.state().runTotal >= 4, 60 * 60000);
+  env.api.stop();
+  const urls = env.api.unlikedUrls();
+  eq(urls.length, env.state().runTotal, 'one URL per verified unlike');
+  includes(urls[0], '/video/', 'looks like a video URL');
+  await env.api.copyUnliked();
+  const copied = env.copied[env.copied.length - 1];
+  eq(copied.split('\n').length, urls.length, 'one URL per line');
+  includes(env.logText(), 'Unliked list', 'the copy is reported');
+});
+
+test('a failed click contributes nothing to the recovery list', async () => {
+  const env = makeEnv({ clickFails: () => true });
+  env.api.start();
+  await runUntilStopped(env, 12 * 3600000);
+  eq(env.api.unlikedUrls().length, 0, 'unverified clicks must not be listed as unliked');
+});
+
+test('copying an empty recovery list says so instead of copying nothing', async () => {
+  const env = makeEnv({});
+  await env.api.copyUnliked();
+  eq(env.copied.length, 0, 'nothing is put on the clipboard');
+  includes(env.logText(), 'No unliked video URLs', 'and it says why');
+});
+
+// --------------------------------------------------------- clipboard failure
+test('copyLog reports success only after the clipboard promise settles', async () => {
+  const env = makeEnv({});
+  await env.api.copyLog();
+  ok(env.copied.length === 1, 'the text reached the clipboard');
+  includes(env.logText(), 'copied to the clipboard', 'success is reported');
+});
+
+test('a rejected clipboard write falls back to execCommand, not to a false success', async () => {
+  const env = makeEnv({ clipboard: 'reject' });
+  env.doc.execCommand = () => true;
+  await env.api.copyLog();
+  eq(env.copied.length, 0, 'the async API failed');
+  includes(env.logText(), 'fallback', 'the fallback path is what reported success');
+});
+
+test('with no clipboard at all the log is printed to the console and says so', async () => {
+  const env = makeEnv({ clipboard: 'none' });
+  await env.api.copyLog();
+  includes(env.logText(), 'Clipboard unavailable', 'the failure is surfaced, not swallowed');
+  ok(env.logText().indexOf('copied to the clipboard') === -1, 'and never claims success');
 });
 
 test('a stale session expires loudly rather than silently zeroing counters', async () => {
