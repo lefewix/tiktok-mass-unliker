@@ -4,7 +4,7 @@ A Chrome extension / userscript that gradually unlikes videos while you browse y
 
 ## Features
 
-- **Liked-feed page guard** — the script refuses to start anywhere except your own Liked view, and pauses immediately if the page navigates away mid-run. The video-viewer selectors match For You, hashtag pages and other people's profiles too, so without this guard a reload plus a habitual **Start** would strip likes off the wrong feed
+- **Anchored liked-feed page guard** — the script refuses to start anywhere except your own Liked view, and pauses immediately if the page navigates away mid-run. Because a liked video's URL carries its *creator's* handle rather than yours, authorisation is taken on your own profile page and carried into the viewer as a per-tab anchor — see [The page guard](#the-page-guard)
 - **Paced sessions** — each session unlikes a randomized number of videos (50–150), then takes a 3–7 minute break before the next one
 - **Randomized delays** — 1.5–5 seconds between videos, plus a short "reaction time" before each click, to avoid bursty request patterns
 - **Processed cap** — a session also breaks after seeing `cap × 2` videos even if it never reaches the unlike cap, so a feed full of already-unliked videos can't spin at full speed forever
@@ -40,22 +40,53 @@ The same script runs as a content script; state is kept in the site's `localStor
 
 ## Usage
 
-1. Go to your TikTok profile and open the **Liked** tab
+1. Go to your TikTok profile and open the **Liked** tab. The panel logs `Liked feed armed for @you` — this step is what authorises the run, so it cannot be skipped by pasting a video URL
 2. Click the first video to enter the video viewer
 3. Press **Start** on the panel in the bottom-right corner. On a real run the first press only *arms* the button — press the amber **Confirm — permanently unlikes** within 5 seconds to actually begin
 4. Keep the tab open and focused; press **Stop** at any time. Switching away pauses the run rather than letting a throttled tab distort the pacing
 
-The panel says `Ready` only when the page guard is satisfied. If it says `Not ready`, it tells you what is wrong — you are on For You, on someone else's profile, or the Liked tab isn't the selected one. Pressing **Start** there does nothing on purpose.
+The panel carries a live readiness line, re-checked every two seconds:
+
+| It says | What to do |
+| --- | --- |
+| `Ready — this is your own Liked feed.` | press **Start** |
+| `Armed for @you — open a video from your Liked grid.` | you are on the grid; open the first video |
+| `Not ready — …` | it names the problem: For You, someone else's profile, the wrong tab, or a video URL you arrived at without going through your Liked grid |
+
+Pressing **Start** when it is not ready does nothing, on purpose.
 
 ### The page guard
 
-Everything below the surface of TikTok's video viewer looks identical on every feed: the same container, the same like button, the same next arrow. The guard is what makes "your Liked feed" a precondition rather than an assumption. It requires all of:
+Everything below the surface of TikTok's video viewer looks identical on every feed: the same container, the same like button, the same next arrow. The guard is what makes "your Liked feed" a precondition rather than an assumption.
 
-- the URL is a profile path (`/@handle…`) — this alone rejects For You, hashtag, search and explore feeds
-- the handle in the URL is **yours**, matched against your own profile link (cached, so it still works with the video modal open)
-- the profile's Liked tab is not explicitly some other tab
+**What the URL can and cannot tell you.** A video opened from your Liked tab lives at `/@<creator>/video/<id>`. The handle in that path belongs to whoever *posted* the video — never to you. Your liked feed is full of other people's videos; that is what liking is. So the URL cannot answer "is this my liked feed?", and a guard built on comparing that handle to your own rejects every video in the feed. (Version 2.0.0 did exactly that and could never run at all — see [Version history](#version-history).)
 
-It runs before **Start** *and* on every loop iteration, so an autoplay, a back button or a tapped hashtag pauses the run within one video instead of unliking its way through a stranger's feed.
+The question is instead answered where it *is* answerable — on your own profile page, where the path really is yours and the Liked tab is visibly selected — and that fact is carried into the viewer as an **anchor**. The anchor lives in `sessionStorage`, so it is per tab: it survives a reload of a running job, and it dies with the tab rather than following you into a fresh window that happened to land on For You.
+
+On a profile page the guard requires:
+
+- the path handle is **yours**, matched against your own profile link in the nav chrome
+- the Liked tab is explicitly the selected tab
+
+Both true, it **arms** the anchor and tells you to open a video. It never runs here — there is nothing to unlike on a grid.
+
+On a video permalink it requires:
+
+- an anchor, armed in this tab, for the account that is *currently* signed in
+- the anchor is not stale — see below
+- no recommendation-feed container is on screen. For You and hashtag feeds also rewrite the address bar to the playing video's `/@creator/video/…` permalink, which is the one lookalike a URL check cannot catch
+- a video viewer container *is* on screen
+- the Liked tab is not explicitly some other tab
+
+The handle in the URL is deliberately **not** checked. That is the fix.
+
+Anchor staleness measures time since the guard last *passed*, not wall-clock age: a running loop re-confirms it once per video, so a long job never expires, while a tab parked on For You for four hours cannot come back and still count as armed.
+
+The guard runs before **Start**, on every loop iteration, *and* on a 2-second idle poll. The poll matters because TikTok is a single-page app: walking from For You to your profile to the Liked tab to a video never reloads the extension, so without it nothing would re-evaluate the guard — or arm the anchor — between page loads. It is also what keeps the panel's readiness line honest instead of showing whatever was true at injection time.
+
+Because it re-runs every iteration, an autoplay, a back button or a tapped hashtag pauses the run within one video instead of unliking its way through a stranger's feed.
+
+Your own handle is read only from signed-in-user chrome (the nav bar profile link, the avatar menu). It is never read from a profile-detail link, which points at whoever's profile is being *viewed* — trusting that cached a stranger as "you", after which their profile read as your own.
 
 ### What the panel shows
 
@@ -93,6 +124,8 @@ The dry-run count (`dryTotal`) lives inside the same 12-hour session window as t
 
 State is stored under `ttmu.v1` via `GM_setValue` (or `localStorage` as a fallback): lifetime total, target, dry-run flag, the "a dry run has been completed" flag behind the first-run default, panel position and collapse state, your cached profile handle, and the current session (unliked, processed, cap, run total, dry total, clicks attempted, failed verifications, session number, last-activity timestamp, and the unliked-URL recovery list, capped at 2000).
 
+The liked-feed anchor is deliberately **not** part of that store. It lives in `sessionStorage` under `ttmu.anchor.v1`, so it is scoped to the tab: authorisation to unlike does not outlive the browsing session that earned it, and it never leaks into a new window.
+
 The session expires **12 hours after the last real activity**. It used to be 6, which was shorter than a measured full run (4–6 hours), so a long job could have its own counters expire underneath it. Expiry is now logged loudly instead of silently zeroing the session.
 
 Only real work — processing a video, rolling a new cap window, starting a run — refreshes that timestamp. Toggling dry run or editing the target does not, so idling in the panel can't extend the window indefinitely. The lifetime total never expires.
@@ -103,7 +136,7 @@ Only real work — processing a video, rolling a new cap window, starting a run 
 
 | Code | What happened |
 | --- | --- |
-| `guard` | the page is no longer your own Liked feed |
+| `guard` | the page is no longer your own Liked feed — a different profile, a recommendation feed, the viewer closed, or the anchor went stale |
 | `no-like-button` | 6 strikes without a like button in the container (~39s of patience) |
 | `indeterminate` | the like state can't be read at all — TikTok's DOM probably changed |
 | `verify-streak` / `verify-window` | clicks aren't flipping the like state: 2 in a row, or 3 of the last 10 |
@@ -153,6 +186,29 @@ Measured on a virtual clock with an instantly-responding page, five seeded runs 
 
 Every number assumes zero page latency, so a real browser is slower. Expect roughly **450–550 per hour** in practice, less on a slow connection.
 
+## Version history
+
+### 2.1.0 — the guard could never pass
+
+**2.0.0 did not run.** The page guard required the handle in the URL to equal your own:
+
+```js
+const here = decodeURIComponent(m[1]).toLowerCase();   // the video's creator
+const own  = ownHandle();                              // you
+if (own && here !== own) return { ok: false, msg: `This is @${here}'s profile, not yours (@${own})…` };
+```
+
+Every video in a Liked feed was posted by someone else, so `here` was always a creator's handle and the guard refused on all of them: *"This is @someone's profile, not yours — refusing to unlike here."* The only page it ever accepted was a video you had both posted and liked yourself.
+
+The test suite could not see it, because the harness generated feed URLs as `/@<your-handle>/video/<n>` — it modelled a liked feed in which you had authored every video, the single shape in which the check passes. The harness now generates `/@creator<n>/video/<id>`, and re-inserting the old comparison fails 26 tests.
+
+Fixed by removing the comparison entirely and replacing it with the anchor described in [The page guard](#the-page-guard). Also in this release:
+
+- `a[data-e2e="user-detail-profile"]` is no longer trusted as a source for your own handle. It is a link to the profile being *viewed*, so on a stranger's profile it cached them as "you" — which would have made the old guard agree that their profile was yours
+- recommendation-feed containers are detected and vetoed, closing the lookalike the URL check never covered: For You rewrites the address bar to `/@creator/video/…` too
+- a 2-second idle poll re-evaluates the guard, so the panel's verdict tracks single-page navigation instead of freezing at whatever was true when the script was injected
+- **Start** on your Liked grid now says to open a video, instead of starting and burning six no-like-button strikes
+
 ## Disclaimer
 
 This script automates interactions with your own account and only removes your own likes. Automation may nonetheless conflict with TikTok's Terms of Service — use at your own risk. Conservative pacing defaults are built in; raising them is not recommended.
@@ -165,7 +221,9 @@ This script automates interactions with your own account and only removes your o
 - The tab must remain open and in the foreground: background tabs get their timers throttled, so pacing drifts. The script auto-pauses when the tab is hidden and resumes when it comes back, so a backgrounded tab costs you time rather than accuracy
 - Verification is only as good as the DOM. If TikTok reports a stale like state, the guards bound the damage to **10 mistaken clicks per run** (see [What the guards actually bound](#what-the-guards-actually-bound)) — not zero, and not "about 3"
 - **Unliking is irreversible from the script's side.** The recovery path is manual: **Copy unliked list** gives you every verified unlike's URL so you can re-like them by hand. The list is capped at 2000 URLs and lives in the same session window as the counters
-- The page guard identifies your account from your own profile link on the page. If TikTok stops rendering it and no handle has been cached yet, the script refuses to start rather than guessing
+- The page guard identifies your account from the signed-in-user chrome on the page (nav profile link, avatar menu). If TikTok stops rendering it and no handle has been cached yet, the script refuses to start rather than guessing
+- The liked-feed anchor is per tab and is armed only by visiting your own profile's Liked tab. Opening a liked video's URL directly in a fresh tab is refused — there is no evidence there that the video came from *your* liked feed rather than from anywhere else on TikTok
+- Distinguishing the liked feed from For You, once For You has rewritten the address bar to a video permalink, rests on recognising TikTok's recommendation-feed containers. If those markers change, the guard fails *closed* — it stops recognising your liked feed and refuses to run, rather than mistaking For You for it
 
 ## Tests
 
@@ -173,7 +231,7 @@ This script automates interactions with your own account and only removes your o
 node test.js
 ```
 
-No dependencies, no test runner, no network. It evaluates the real `tiktok-mass-unliker.user.js` in a `vm` context against a hand-rolled DOM, a virtual clock and seeded RNGs, prints a pass/fail line per test, and exits non-zero on failure. It covers the page guard, the determinacy guard, pause-code escalation, the cumulative ceiling, the next-button deny/allow rules, the two-click confirm-arm on Start and Reset, the first-run dry-run default, adversarial like-state input (`"Like video, liked by 1.2M"`, near-white `rgba(254,254,254)` fills, a comment drawer's like button), the non-flooding countdown, the unliked-URL recovery list, every tier of the clipboard fallback, and a regression guard asserting the windowed failure tracker still trips at 2/5/10/20% failure rates. Every number in this README is produced by that harness.
+No dependencies, no test runner, no network. It evaluates the real `tiktok-mass-unliker.user.js` in a `vm` context against a hand-rolled DOM, a virtual clock and seeded RNGs, prints a pass/fail line per test, and exits non-zero on failure. It covers the page guard — including the anchor lifecycle, a liked video posted by another creator, a cold landing on a video URL, a For You feed rewritten to a video permalink, anchor staleness, and the profile-detail link that must never identify you — the determinacy guard, pause-code escalation, the cumulative ceiling, the next-button deny/allow rules, the two-click confirm-arm on Start and Reset, the first-run dry-run default, adversarial like-state input (`"Like video, liked by 1.2M"`, near-white `rgba(254,254,254)` fills, a comment drawer's like button), the non-flooding countdown, the unliked-URL recovery list, every tier of the clipboard fallback, and a regression guard asserting the windowed failure tracker still trips at 2/5/10/20% failure rates. Every number in this README is produced by that harness.
 
 ## Contributing
 

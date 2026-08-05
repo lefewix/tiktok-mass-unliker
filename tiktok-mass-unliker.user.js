@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         TikTok Mass Unliker
 // @namespace    flxtcg.tools
-// @version      2.0.0
-// @description  Gradually unlikes videos while browsing your own Liked feed. Liked-feed page guard, confirm-armed start, dry-run-by-default first run, paced clicking, windowed + cumulative click verification, container-scoped selectors, session caps, target count, unliked-URL export, and a movable start/stop panel.
+// @version      2.1.0
+// @description  Gradually unlikes videos while browsing your own Liked feed. Anchored liked-feed page guard, confirm-armed start, dry-run-by-default first run, paced clicking, windowed + cumulative click verification, container-scoped selectors, session caps, target count, unliked-URL export, and a movable start/stop panel.
 // @author       Felix Wang
 // @license      MIT
 // @match        https://www.tiktok.com/*
@@ -53,6 +53,11 @@
     detConsecutive: 4,        //   fast path: this many unreadable in a row
 
     sessionIdleMs: 12 * 3600000, // persisted session window expires after 12h idle
+    // The liked-feed anchor (see the page guard) goes stale after this much
+    // IDLE time. A running loop re-confirms it every iteration, so only real
+    // idling counts against it.
+    anchorIdleMs: 4 * 3600000,
+    readyPollMs: 2000,        // how often the idle readiness/arming poll runs
     resumeBackoffMs: 30000,   // first backoff after a repeated same-reason pause
     resumeBackoffMaxMs: 5 * 60000,
     resumeGiveUpAfter: 5,     // refuse to resume after this many identical pauses
@@ -313,67 +318,7 @@
     updateUI();
   }
 
-  // ---------------- Page guard ----------------
-  // The container selectors below match TikTok's video viewer EVERYWHERE — For
-  // You, hashtag pages, someone else's profile. Without this guard, reloading
-  // onto For You and pressing Start from habit strips likes off the wrong feed
-  // at ~500/hour. Nothing starts, and nothing keeps running, unless the
-  // location still looks like the user's own liked view.
-  const HANDLE_RE = /^\/@([^/?#]+)/;
-
-  function ownHandle() {
-    for (const sel of [
-      'a[data-e2e="nav-profile"]',
-      '[data-e2e="profile-icon"] a[href^="/@"]',
-      'a[data-e2e="user-detail-profile"]',
-    ]) {
-      const el = document.querySelector(sel);
-      const href = el && (el.getAttribute('href') || '');
-      const m = href && href.match(HANDLE_RE);
-      if (m) {
-        const h = decodeURIComponent(m[1]).toLowerCase();
-        if (h && h !== ownHandleCache) { ownHandleCache = h; save(false); }
-        return h;
-      }
-    }
-    return ownHandleCache || '';   // last known handle survives the video modal
-  }
-
-  // 'yes' | 'no' | 'unknown'. Unknown is never a veto on its own — the tab strip
-  // is not always rendered behind the video modal.
-  function likedTabState() {
-    const tab = document.querySelector('[data-e2e="liked-tab"]');
-    if (!tab) return 'unknown';
-    const sel = tab.getAttribute('aria-selected')
-      ?? tab.closest('[aria-selected]')?.getAttribute('aria-selected');
-    if (sel === 'true') return 'yes';
-    if (sel === 'false') return 'no';
-    return 'unknown';
-  }
-
-  // { ok, msg }. Called before start() and again on every loop iteration.
-  function pageGuard() {
-    const m = (location.pathname || '').match(HANDLE_RE);
-    if (!m) {
-      return { ok: false, msg: 'Not on a profile page — this looks like For You, a hashtag or search feed. ' +
-        'Open your own profile, pick the Liked tab, then open a video from it.' };
-    }
-    const here = decodeURIComponent(m[1]).toLowerCase();
-    const own = ownHandle();
-    if (own && here !== own) {
-      return { ok: false, msg: `This is @${here}'s profile, not yours (@${own}) — refusing to unlike here.` };
-    }
-    if (likedTabState() === 'no') {
-      return { ok: false, msg: 'The Liked tab is not the selected tab on this profile — open Liked first.' };
-    }
-    if (!own) {
-      return { ok: false, msg: "Can't confirm this is your own Liked feed — your profile link wasn't found on the page. " +
-        'Open your profile, pick the Liked tab, then open a video from it.' };
-    }
-    return { ok: true, msg: '' };
-  }
-
-  // ---------------- Like button detection ----------------
+  // ---------------- Viewer detection ----------------
   // Everything is scoped to the active video container so an open comment
   // drawer can never hand us a comment's like button.
   const CONTAINER_SELECTORS = [
@@ -382,6 +327,17 @@
     '#main-content-video_detail',
     'div[class*="DivBrowserModeContainer"]',
     'div[class*="DivVideoDetailContainer"]',
+  ];
+
+  // Recommendation feeds render the same viewer chrome as the liked feed AND
+  // rewrite the address bar to the playing video's canonical /@author/video/id
+  // path, so on a URL basis a For You video is indistinguishable from a liked
+  // one. These markers are what tells them apart, and a match is a hard veto.
+  const FEED_SELECTORS = [
+    '[data-e2e="recommend-list-item-container"]',
+    '[data-e2e="feed-video"]',
+    'div[class*="DivVideoFeed"]',
+    'div[class*="DivRecommend"]',
   ];
 
   // In a multi-item feed the first document-wide match is not necessarily the
@@ -413,6 +369,233 @@
     }
     return best;
   }
+
+  function visibleMatch(selectors) {
+    for (const sel of selectors) {
+      for (const el of document.querySelectorAll(sel)) {
+        if (visibleArea(el) > 0) return el;
+      }
+    }
+    return null;
+  }
+
+  // 'feed' | 'viewer' | 'none'. Checked in that order: a recommendation feed
+  // wins over a viewer match, because For You keeps a detail-ish container in
+  // the tree and we must fail towards "this is not your liked feed".
+  function viewerKind() {
+    if (visibleMatch(FEED_SELECTORS)) return 'feed';
+    if (visibleMatch(CONTAINER_SELECTORS)) return 'viewer';
+    return 'none';
+  }
+
+  // ---------------- Page guard ----------------
+  // The container selectors above match TikTok's video viewer EVERYWHERE — For
+  // You, hashtag pages, someone else's profile. Without this guard, reloading
+  // onto For You and pressing Start from habit strips likes off the wrong feed
+  // at ~500/hour. Nothing starts, and nothing keeps running, unless the page
+  // still looks like the user's own liked view.
+  //
+  // WHAT THE URL CAN AND CANNOT TELL US
+  // A video opened from your Liked tab lives at /@<creator>/video/<id>: the
+  // handle in the path is the video's AUTHOR, never yours — your liked feed is
+  // full of other people's videos, that is what liking is. An earlier guard
+  // compared that handle to your own and refused with "this is @x's profile,
+  // not yours" on every single video, so the script could never run at all. It
+  // only ever passed on a video you had both posted and liked.
+  //
+  // The URL therefore cannot answer "is this my liked feed?". So it is answered
+  // where it IS answerable — on your own profile, where the path is yours and
+  // the Liked tab is visibly selected — and that fact is carried into the
+  // viewer as an ANCHOR. The anchor is per-tab (sessionStorage): it survives a
+  // reload of the run, and it dies with the tab rather than following the user
+  // into a fresh window that landed on For You.
+  const HANDLE_RE = /^\/@([^/?#]+)/;
+  const ANCHOR_KEY = 'ttmu.anchor.v1';
+
+  function ownHandle() {
+    // Signed-in-user chrome ONLY. `a[data-e2e="user-detail-profile"]` used to
+    // be in this list and is a PROFILE-DETAIL link: on a stranger's profile it
+    // points at THEM, so it cached a stranger as "you" — after which the guard
+    // would have happily agreed that their profile was your own.
+    for (const sel of [
+      'a[data-e2e="nav-profile"]',
+      '[data-e2e="nav-profile"] a[href^="/@"]',
+      '[data-e2e="profile-icon"] a[href^="/@"]',
+      'a[data-e2e="profile-icon"]',
+    ]) {
+      const el = document.querySelector(sel);
+      const href = el && (el.getAttribute('href') || '');
+      const m = href && href.match(HANDLE_RE);
+      if (m) {
+        const h = decodeURIComponent(m[1]).toLowerCase();
+        if (h && h !== ownHandleCache) { ownHandleCache = h; save(false); }
+        return h;
+      }
+    }
+    return ownHandleCache || '';   // last known handle survives the video modal
+  }
+
+  // What kind of page the URL describes. 'item' is a video/photo permalink —
+  // the handle in it belongs to the AUTHOR and is deliberately never compared
+  // to the user's own.
+  function pathInfo() {
+    const m = (location.pathname || '').match(/^\/@([^/?#]+)(?:\/([^/?#]+))?/);
+    if (!m) return { kind: 'other', handle: '' };
+    const handle = decodeURIComponent(m[1]).toLowerCase();
+    const seg = m[2] || '';
+    if (!seg) return { kind: 'profile', handle };
+    if (seg === 'video' || seg === 'photo') return { kind: 'item', handle };
+    return { kind: 'other', handle };   // /@x/live and friends
+  }
+
+  // 'yes' | 'no' | 'unknown'. Unknown is never a veto on its own — the tab strip
+  // is not always rendered behind the video modal.
+  function likedTabState() {
+    const tab = document.querySelector('[data-e2e="liked-tab"]');
+    if (!tab) return 'unknown';
+    const sel = tab.getAttribute('aria-selected')
+      ?? tab.closest('[aria-selected]')?.getAttribute('aria-selected');
+    if (sel === 'true') return 'yes';
+    if (sel === 'false') return 'no';
+    return 'unknown';
+  }
+
+  // ---- Liked-feed anchor (per tab) ----
+  let anchor = null;        // { handle, at }
+  let anchorSavedAt = 0;
+
+  function anchorStore() {
+    try {
+      return typeof sessionStorage !== 'undefined' ? sessionStorage : null;
+    } catch (e) {
+      return null;   // storage partitioning / disabled cookies
+    }
+  }
+
+  function writeAnchor() {
+    const s = anchorStore();
+    if (!s) return;
+    try {
+      if (anchor) s.setItem(ANCHOR_KEY, JSON.stringify(anchor));
+      else s.removeItem(ANCHOR_KEY);
+      anchorSavedAt = Date.now();
+    } catch (e) { /* in-memory only */ }
+  }
+
+  function loadAnchor() {
+    const s = anchorStore();
+    if (!s) return;
+    try {
+      const a = JSON.parse(s.getItem(ANCHOR_KEY) || 'null');
+      const at = a && Number(a.at) || 0;
+      if (a && typeof a.handle === 'string' && a.handle &&
+          Date.now() - at < CFG.anchorIdleMs) {
+        anchor = { handle: a.handle, at };
+        anchorSavedAt = at;
+      }
+    } catch (e) { /* no anchor */ }
+  }
+
+  function armAnchor(handle) {
+    const isNew = !anchor || anchor.handle !== handle;
+    anchor = { handle, at: Date.now() };
+    writeAnchor();
+    if (isNew) log(`Liked feed armed for @${handle}.`);
+  }
+
+  // Called on every passing guard check, so the staleness window measures IDLE
+  // time rather than run length. The persisted copy is throttled — the loop
+  // calls this once per video and sessionStorage does not need the churn.
+  function touchAnchor() {
+    if (!anchor) return;
+    anchor.at = Date.now();
+    if (anchor.at - anchorSavedAt > 60000) writeAnchor();
+  }
+
+  function clearAnchor() {
+    if (!anchor) return;
+    anchor = null;
+    writeAnchor();
+  }
+
+  // { ok, stage, msg }. Called before start(), on every loop iteration, and on
+  // the idle readiness poll — the poll is what arms the anchor when the user
+  // walks to their Liked tab without ever reloading the page.
+  //
+  // stage: 'viewer' (ok to run) | 'profile' (own Liked grid, nothing to unlike
+  // yet, anchor armed) | 'none'.
+  function pageGuard() {
+    const own = ownHandle();
+    const info = pathInfo();
+
+    if (!own) {
+      return { ok: false, stage: 'none', msg:
+        "Can't tell which account is signed in — your own profile link isn't on the page. " +
+        'Make sure you are logged in, open your profile, then pick the Liked tab.' };
+    }
+
+    // --- your own profile: the one place the URL proves whose feed this is ---
+    if (info.kind === 'profile') {
+      if (info.handle !== own) {
+        clearAnchor();
+        return { ok: false, stage: 'none', msg:
+          `This is @${info.handle}'s profile, not yours (@${own}) — open your own profile.` };
+      }
+      const tab = likedTabState();
+      if (tab !== 'yes') {
+        return { ok: false, stage: 'none', msg: tab === 'no'
+          ? 'The Liked tab is not the selected tab on your profile — open Liked first.'
+          : "Can't see a selected Liked tab on this profile — open the Liked tab." };
+      }
+      armAnchor(own);
+      return { ok: false, stage: 'profile', msg:
+        'the video viewer is not open — open a video from your Liked grid.' };
+    }
+
+    if (info.kind !== 'item') {
+      return { ok: false, stage: 'none', msg:
+        'Not on a profile or on a video opened from one — this looks like For You, a hashtag or a ' +
+        'search feed. Open your own profile, pick the Liked tab, then open a video from it.' };
+    }
+
+    // --- a video permalink. info.handle is the CREATOR's and is NOT checked ---
+    const kind = viewerKind();
+    if (kind === 'feed') {
+      clearAnchor();
+      return { ok: false, stage: 'none', msg:
+        'This is a recommendation feed showing a video URL, not your Liked feed — For You and ' +
+        'hashtag feeds put /@creator/video/… in the address bar too. Open your Liked tab instead.' };
+    }
+    if (likedTabState() === 'no') {
+      clearAnchor();
+      return { ok: false, stage: 'none', msg:
+        'The Liked tab is no longer selected on the profile behind this video — open Liked first.' };
+    }
+    if (!anchor) {
+      return { ok: false, stage: 'none', msg:
+        `Can't confirm this video came from your own Liked feed. Open your profile (@${own}), ` +
+        'pick the Liked tab, then open a video from the grid — that is what arms the run.' };
+    }
+    if (anchor.handle !== own) {
+      clearAnchor();
+      return { ok: false, stage: 'none', msg:
+        `The signed-in account changed to @${own} since the Liked feed was armed — reopen your Liked tab.` };
+    }
+    if (Date.now() - anchor.at > CFG.anchorIdleMs) {
+      clearAnchor();
+      return { ok: false, stage: 'none', msg:
+        `Your Liked grid was last open over ${Math.round(CFG.anchorIdleMs / 3600000)}h ago — ` +
+        'reopen your profile\'s Liked tab to re-arm.' };
+    }
+    if (kind !== 'viewer') {
+      return { ok: false, stage: 'none', msg:
+        "No video viewer is on screen — go back to your Liked grid and open a video from it." };
+    }
+    touchAnchor();
+    return { ok: true, stage: 'viewer', msg: '' };
+  }
+
+  // ---------------- Like button detection ----------------
 
   // TikTok's DOM shifts often; try several strategies, most specific first.
   // No container => no button. There is deliberately NO document-wide fallback:
@@ -755,7 +938,12 @@
     const guard = pageGuard();
     if (!guard.ok) {
       mode = 'idle';
-      log(`Not starting — ${guard.msg}`);
+      // The Liked grid is a near miss, not a wrong page: the run is armed and
+      // one click away. Saying "not on a profile page" there would send the
+      // user looking for a problem that does not exist.
+      log(guard.stage === 'profile'
+        ? 'Not starting — you are on your Liked grid. Open the first video from it, then press Start.'
+        : `Not starting — ${guard.msg}`);
       updateUI();
       return;
     }
@@ -1041,6 +1229,11 @@
         color: var(--ttmu-ac-pale); font-size: 11px;
         font-variant-numeric: tabular-nums;
       }
+      #ttmu-ready {
+        margin-top: 8px;
+        color: var(--ttmu-m7); font-size: 11px; line-height: 1.45;
+      }
+      #ttmu-ready.go { color: var(--ttmu-ac-pale); }
       @media (prefers-reduced-motion: reduce) {
         #ttmu-panel, #ttmu-panel * {
           animation: none !important;
@@ -1065,6 +1258,7 @@
       <input type="number" id="ttmu-target" min="0" step="10" placeholder="0">
     </div>
     <div id="ttmu-countdown" class="hidden"></div>
+    <div id="ttmu-ready" class="hidden"></div>
     <button id="ttmu-resume" class="hidden">Resume</button>
     <button id="ttmu-btn">Start</button>
     <div class="btnrow">
@@ -1241,6 +1435,16 @@
     el.classList.toggle('hidden', !text);
   }
 
+  // Same treatment for the readiness line: it is re-evaluated every couple of
+  // seconds, so it must never append to the log.
+  function setReady(text, go) {
+    const el = $('#ttmu-ready');
+    if (!el) return;
+    el.textContent = text || '';
+    el.classList.toggle('hidden', !text);
+    el.classList.toggle('go', !!go);
+  }
+
   function log(msg) {
     logHist.push(`${stamp()}  ${msg}`);
     while (logHist.length > CFG.logHistory) logHist.shift();
@@ -1293,20 +1497,39 @@
     return copyText(unlikedUrls.join('\n'), `Unliked list (${unlikedUrls.length} URLs)`);
   }
 
+  loadAnchor();
   updateUI();
 
-  {
+  // TikTok is a single-page app: walking from For You to your profile to the
+  // Liked tab to a video never reloads the script, so nothing would re-run the
+  // guard between page loads. The panel used to evaluate it exactly once, at
+  // injection, and then show that verdict forever. This slow poll keeps the
+  // readiness line honest AND is what arms the liked-feed anchor the moment the
+  // user's own Liked grid comes into view.
+  let readyTimer = 0;
+
+  function refreshReadiness() {
+    if (running) { setReady(''); return; }
     const g = pageGuard();
-    log(g.ok
-      ? 'Ready — this looks like your own Liked feed. Press Start.'
-      : `Not ready — ${g.msg}`);
+    if (g.ok) setReady('Ready — this is your own Liked feed. Press Start.', true);
+    else if (g.stage === 'profile') setReady(`Armed for @${ownHandleCache} — open a video from your Liked grid.`, true);
+    else setReady(`Not ready — ${g.msg}`);
   }
+
+  function readinessTick() {
+    readyTimer = 0;
+    try { refreshReadiness(); } catch (e) { /* never let the poll die */ }
+    readyTimer = setTimeout(readinessTick, CFG.readyPollMs);
+  }
+  readinessTick();
 
   // Debug / test hook.
   window.__TTMU__ = {
     CFG, P,
     start, stop, resume, pause, setDryRun, setTarget, resetCounters,
     findNextButton, findLikeButton, isLiked, pageGuard, ownHandle,
+    pathInfo, viewerKind, likedTabState, refreshReadiness,
+    anchor: () => (anchor ? { handle: anchor.handle, at: anchor.at } : null),
     copyLog, copyUnliked,
     unlikedUrls: () => unlikedUrls.slice(),
     get panel() { return panel; },
