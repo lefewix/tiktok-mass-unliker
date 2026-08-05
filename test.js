@@ -606,8 +606,10 @@ test('a cold landing on a liked-feed video URL is refused, not guessed at', asyn
 
 test('a For You feed rewritten to a video URL is refused even with an anchor', async () => {
   // The dangerous lookalike: same permalink shape, same viewer chrome, an
-  // anchor still fresh from the Liked grid earlier in this tab.
+  // anchor still fresh from the Liked grid earlier in this tab. A real For You
+  // page has no browse-mode container — it was not opened from a list.
   const env = makeEnv({ feedMarkup: true, likedTab: null, anchored: true });
+  env.container.setAttribute('data-e2e', 'x');
   eq(env.api.viewerKind(), 'feed', 'the recommendation container is detected');
   const g = env.api.pageGuard();
   eq(g.ok, false, 'must not treat For You as the liked feed');
@@ -616,6 +618,88 @@ test('a For You feed rewritten to a video URL is refused even with an anchor', a
   env.api.start();
   await env.clock.advanceUntil(null, 60000);
   eq(env.clicks, 0, 'nothing was clicked');
+});
+
+// The liked-feed modal IS a vertical video feed component, so TikTok's hashed
+// feed classes render there too. Vetoing on a class substring blocked the one
+// page the script exists to run on.
+test('a browse-mode marker outranks a feed-ish class on the same page', async () => {
+  const env = makeEnv({});
+  for (const cls of ['DivVideoFeedV2', 'DivVideoFeedContainer', 'DivRecommendList']) {
+    const noise = env.doc.createElement('div');
+    noise.setAttribute('class', `tiktok-abc123-${cls} e1234`);
+    env.doc.body.appendChild(noise);
+  }
+  eq(env.api.viewerKind(), 'browse', 'the browse container settles it');
+  const g = env.api.pageGuard();
+  eq(g.ok, true, `a feed-shaped class name must not veto the liked feed (${g.msg})`);
+});
+
+test('a real recommendation hook still vetoes when nothing proves browse mode', async () => {
+  const env = makeEnv({ feedMarkup: true, likedTab: null });
+  env.container.setAttribute('data-e2e', 'x');          // drop the browse hook
+  env.container.setAttribute('id', 'main-content-video_detail');
+  eq(env.api.viewerKind(), 'feed', 'with no browse proof the feed hook decides');
+  eq(env.api.pageGuard().ok, false, 'and the run is refused');
+});
+
+test('a recommendation hook alongside browse mode does not veto', async () => {
+  // For You's hook can linger in the tree after an in-app navigation into the
+  // profile viewer; proof of browse mode has to win or nothing ever runs.
+  const env = makeEnv({ feedMarkup: true });
+  eq(env.api.viewerKind(), 'browse', 'browse proof beats a lingering feed hook');
+  eq(env.api.pageGuard().ok, true, 'run allowed');
+});
+
+// ------------------------------------------------------ handles must be handles
+test('a handle-shaped check rejects junk the DOM or URL hands over', async () => {
+  const env = makeEnv({});
+  const bad = [
+    'DriverStore\\FileRepository\\netxex64.inf_amd64_01587744078125a1\\ixe60x64.sys',
+    'a b', 'x'.repeat(25), 'user/name', 'user@host', '',
+  ];
+  for (const h of bad) {
+    env.goto(`https://www.tiktok.com/@${h}`);
+    eq(env.api.pathInfo().kind, 'other', `must not read as a profile: ${JSON.stringify(h)}`);
+  }
+  for (const h of ['flx.01', 'me', 'a_b.c123', 'x'.repeat(24)]) {
+    env.goto(`https://www.tiktok.com/@${h}`);
+    eq(env.api.pathInfo().handle, h, `must read as a profile: ${h}`);
+  }
+});
+
+test('a junk profile link never becomes the signed-in user', async () => {
+  const env = makeEnv({ handle: '', anchored: false, likedTab: null });
+  const a = env.doc.createElement('a');
+  a.setAttribute('data-e2e', 'nav-profile');
+  a.setAttribute('href', '/@DriverStore\\FileRepository\\netxex64.inf_amd64_x\\ixe60x64.sys');
+  env.doc.body.appendChild(a);
+  eq(env.api.ownHandle(), '', 'a Windows path is not a TikTok username');
+  const g = env.api.pageGuard();
+  eq(g.ok, false, 'and nothing may run without a real account');
+  includes(g.msg, 'which account is signed in', 'says what is missing');
+});
+
+test('a junk path cannot arm the anchor', async () => {
+  const env = makeEnv({
+    href: 'https://www.tiktok.com/@DriverStore\\FileRepository\\x\\y.sys',
+    anchored: false, likedTab: 'yes',
+  });
+  eq(env.api.anchor(), null, 'a non-handle path must never arm a run');
+  includes(env.panelText('#ttmu-ready'), 'Not ready', 'and the panel says so');
+  ok(env.logText().indexOf('DriverStore') === -1, 'and never reports it as a username');
+  ok(env.panelText('#ttmu-ready').indexOf('DriverStore') === -1, 'nor renders it as one');
+});
+
+test('diagnose reports what the guard actually saw', async () => {
+  const env = makeEnv({});
+  const d = env.api.diagnose();
+  eq(d.ownHandle, 'me', 'own handle');
+  eq(d.ownHandleFrom, 'a[data-e2e="nav-profile"]', 'and which selector produced it');
+  eq(d.viewerKind, 'browse', 'viewer kind');
+  eq(d.guard.ok, true, 'guard verdict');
+  ok(d.browseMarkers.length >= 1, 'lists the browse markers it found');
+  eq(d.feedMarkers.length, 0, 'and finds no feed markers here');
 });
 
 test('a stale anchor expires instead of authorising forever', async () => {
