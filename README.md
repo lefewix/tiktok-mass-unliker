@@ -74,11 +74,20 @@ On a video permalink it requires:
 
 - an anchor, armed in this tab, for the account that is *currently* signed in
 - the anchor is not stale — see below
-- no recommendation-feed container is on screen. For You and hashtag feeds also rewrite the address bar to the playing video's `/@creator/video/…` permalink, which is the one lookalike a URL check cannot catch
-- a video viewer container *is* on screen
+- a video viewer container is on screen, and it is not a recommendation feed
 - the Liked tab is not explicitly some other tab
 
 The handle in the URL is deliberately **not** checked. That is the fix.
+
+**Browse mode versus For You.** For You and hashtag feeds also rewrite the address bar to the playing video's `/@creator/video/…` permalink, so that lookalike has to be settled in the DOM. Proof beats inference, in this order:
+
+1. a **browse-mode** container (`data-e2e="browse-video"`, `browse-container`, `DivBrowserModeContainer`) means the video was opened *from a list* — which a recommendation feed never is. This settles it outright
+2. otherwise, a recommendation hook (`data-e2e="recommend-list-item-container"`, `feed-video"`) vetoes the run
+3. otherwise, a bare video-detail container counts as a viewer
+
+Only high-confidence `data-e2e` hooks may be feed markers. Hashed class substrings must not: the liked-feed modal *is* a vertical video feed component, so `DivVideoFeedV2` and friends render there too, and vetoing on them blocked the one page the script exists to run on.
+
+**Handles must look like handles.** Every handle — from a URL, from a profile link, from the persisted anchor — goes through one validator: lowercase, `[a-z0-9_.]`, at most 24 characters. `[^/?#]+` on its own accepts backslashes, spaces and punctuation, which once let a Windows driver path (`@DriverStore\FileRepository\…\ixe60x64.sys`) through as a username and arm a run. Anything not shaped like a handle is not a handle, whatever produced it.
 
 Anchor staleness measures time since the guard last *passed*, not wall-clock age: a running loop re-confirms it once per video, so a long job never expires, while a tab parked on For You for four hours cannot come back and still count as armed.
 
@@ -205,7 +214,8 @@ The test suite could not see it, because the harness generated feed URLs as `/@<
 Fixed by removing the comparison entirely and replacing it with the anchor described in [The page guard](#the-page-guard). Also in this release:
 
 - `a[data-e2e="user-detail-profile"]` is no longer trusted as a source for your own handle. It is a link to the profile being *viewed*, so on a stranger's profile it cached them as "you" — which would have made the old guard agree that their profile was yours
-- recommendation-feed containers are detected and vetoed, closing the lookalike the URL check never covered: For You rewrites the address bar to `/@creator/video/…` too
+- recommendation-feed containers are detected and vetoed, closing the lookalike the URL check never covered: For You rewrites the address bar to `/@creator/video/…` too. A browse-mode marker outranks the veto, because the liked-feed modal is itself a video feed component and hashed classes like `DivVideoFeedV2` render in both
+- handles are validated against `[a-z0-9_.]{1,24}` everywhere they are read. The old `[^/?#]+` capture accepted a Windows driver path as a username and armed a run with it
 - a 2-second idle poll re-evaluates the guard, so the panel's verdict tracks single-page navigation instead of freezing at whatever was true when the script was injected
 - **Start** on your Liked grid now says to open a video, instead of starting and burning six no-like-button strikes
 
@@ -223,7 +233,8 @@ This script automates interactions with your own account and only removes your o
 - **Unliking is irreversible from the script's side.** The recovery path is manual: **Copy unliked list** gives you every verified unlike's URL so you can re-like them by hand. The list is capped at 2000 URLs and lives in the same session window as the counters
 - The page guard identifies your account from the signed-in-user chrome on the page (nav profile link, avatar menu). If TikTok stops rendering it and no handle has been cached yet, the script refuses to start rather than guessing
 - The liked-feed anchor is per tab and is armed only by visiting your own profile's Liked tab. Opening a liked video's URL directly in a fresh tab is refused — there is no evidence there that the video came from *your* liked feed rather than from anywhere else on TikTok
-- Distinguishing the liked feed from For You, once For You has rewritten the address bar to a video permalink, rests on recognising TikTok's recommendation-feed containers. If those markers change, the guard fails *closed* — it stops recognising your liked feed and refuses to run, rather than mistaking For You for it
+- Distinguishing the liked feed from For You, once For You has rewritten the address bar to a video permalink, rests on TikTok's `data-e2e` hooks. The liked feed is recognised by a positive browse-mode marker, so if *that* hook disappears the guard fails **closed** — it stops recognising your liked feed and refuses to run. The reverse case is the weaker one: if the `recommend-list-item-container` hook disappeared *and* For You started rendering a browse-mode container, a For You video could be mistaken for a liked one. Reaching that state also requires having armed the anchor from your own Liked grid in the same tab
+- Diagnosing a refusal you disagree with: run `__TTMU__.diagnose()` in the console. It prints the path, the handle and which selector produced it, the liked-tab state, every viewer/feed/browse marker found, the anchor age, and the guard's verdict
 
 ## Tests
 
@@ -231,7 +242,7 @@ This script automates interactions with your own account and only removes your o
 node test.js
 ```
 
-No dependencies, no test runner, no network. It evaluates the real `tiktok-mass-unliker.user.js` in a `vm` context against a hand-rolled DOM, a virtual clock and seeded RNGs, prints a pass/fail line per test, and exits non-zero on failure. It covers the page guard — including the anchor lifecycle, a liked video posted by another creator, a cold landing on a video URL, a For You feed rewritten to a video permalink, anchor staleness, and the profile-detail link that must never identify you — the determinacy guard, pause-code escalation, the cumulative ceiling, the next-button deny/allow rules, the two-click confirm-arm on Start and Reset, the first-run dry-run default, adversarial like-state input (`"Like video, liked by 1.2M"`, near-white `rgba(254,254,254)` fills, a comment drawer's like button), the non-flooding countdown, the unliked-URL recovery list, every tier of the clipboard fallback, and a regression guard asserting the windowed failure tracker still trips at 2/5/10/20% failure rates. Every number in this README is produced by that harness.
+No dependencies, no test runner, no network. It evaluates the real `tiktok-mass-unliker.user.js` in a `vm` context against a hand-rolled DOM, a virtual clock and seeded RNGs, prints a pass/fail line per test, and exits non-zero on failure. It covers the page guard — including the anchor lifecycle, a liked video posted by another creator, a cold landing on a video URL, a For You feed rewritten to a video permalink, browse-mode precedence over feed-shaped class names, handle validation against junk (a Windows driver path among it), anchor staleness, and the profile-detail link that must never identify you — the determinacy guard, pause-code escalation, the cumulative ceiling, the next-button deny/allow rules, the two-click confirm-arm on Start and Reset, the first-run dry-run default, adversarial like-state input (`"Like video, liked by 1.2M"`, near-white `rgba(254,254,254)` fills, a comment drawer's like button), the non-flooding countdown, the unliked-URL recovery list, every tier of the clipboard fallback, and a regression guard asserting the windowed failure tracker still trips at 2/5/10/20% failure rates. Every number in this README is produced by that harness.
 
 ## Contributing
 

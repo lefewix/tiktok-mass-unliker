@@ -329,15 +329,29 @@
     'div[class*="DivVideoDetailContainer"]',
   ];
 
+  // Browse mode: TikTok opened this video FROM A LIST (a profile grid, search
+  // results). These are unambiguous — the recommendation feed never renders
+  // them — so a match here is proof of browse mode and outranks everything.
+  const BROWSE_SELECTORS = [
+    'div[data-e2e="browse-video"]',
+    'div[data-e2e="browse-container"]',
+    'div[class*="DivBrowserModeContainer"]',
+  ];
+
   // Recommendation feeds render the same viewer chrome as the liked feed AND
   // rewrite the address bar to the playing video's canonical /@author/video/id
   // path, so on a URL basis a For You video is indistinguishable from a liked
-  // one. These markers are what tells them apart, and a match is a hard veto.
+  // one. These markers are the tie-breaker when no browse marker is present.
+  //
+  // ONLY high-confidence data-e2e hooks belong here. `div[class*="DivVideoFeed"]`
+  // and `div[class*="DivRecommend"]` were in this list and were guesses: the
+  // liked-feed modal IS a vertical video feed component, so a hashed class like
+  // DivVideoFeedV2 renders there too and the veto fired on the one page the
+  // whole script exists to run on. A veto built on a substring guess fails
+  // closed in the wrong place.
   const FEED_SELECTORS = [
     '[data-e2e="recommend-list-item-container"]',
     '[data-e2e="feed-video"]',
-    'div[class*="DivVideoFeed"]',
-    'div[class*="DivRecommend"]',
   ];
 
   // In a multi-item feed the first document-wide match is not necessarily the
@@ -379,10 +393,14 @@
     return null;
   }
 
-  // 'feed' | 'viewer' | 'none'. Checked in that order: a recommendation feed
-  // wins over a viewer match, because For You keeps a detail-ish container in
-  // the tree and we must fail towards "this is not your liked feed".
+  // 'browse' | 'feed' | 'viewer' | 'none'.
+  //
+  // Proof beats inference: a browse-mode marker means the video was opened from
+  // a list, which the recommendation feed never is, so it settles the question
+  // outright. The feed markers only arbitrate the ambiguous case — a bare
+  // detail container with nothing saying where it came from.
   function viewerKind() {
+    if (visibleMatch(BROWSE_SELECTORS)) return 'browse';
     if (visibleMatch(FEED_SELECTORS)) return 'feed';
     if (visibleMatch(CONTAINER_SELECTORS)) return 'viewer';
     return 'none';
@@ -412,6 +430,26 @@
   const HANDLE_RE = /^\/@([^/?#]+)/;
   const ANCHOR_KEY = 'ttmu.anchor.v1';
 
+  // A TikTok handle is letters, digits, underscores and periods, up to 24
+  // characters. `[^/?#]+` alone accepts backslashes, spaces and punctuation,
+  // which is how a Windows driver path — @DriverStore\FileRepository\…\x.sys —
+  // was once accepted as a username and armed the run. Anything that is not
+  // shaped like a handle is not a handle, whatever produced it.
+  const HANDLE_SHAPE = /^[a-z0-9_.]{1,24}$/;
+
+  // '' when the string is absent or not handle-shaped. Everything that reads a
+  // handle goes through here, so a malformed one can never reach the guard.
+  function cleanHandle(raw) {
+    if (!raw) return '';
+    let h = String(raw);
+    try { h = decodeURIComponent(h); } catch (e) { /* keep the raw form */ }
+    h = h.toLowerCase();
+    return HANDLE_SHAPE.test(h) ? h : '';
+  }
+
+  // Which selector last produced the own handle, for diagnose().
+  let ownHandleSource = '';
+
   function ownHandle() {
     // Signed-in-user chrome ONLY. `a[data-e2e="user-detail-profile"]` used to
     // be in this list and is a PROFILE-DETAIL link: on a stranger's profile it
@@ -426,13 +464,18 @@
       const el = document.querySelector(sel);
       const href = el && (el.getAttribute('href') || '');
       const m = href && href.match(HANDLE_RE);
-      if (m) {
-        const h = decodeURIComponent(m[1]).toLowerCase();
-        if (h && h !== ownHandleCache) { ownHandleCache = h; save(false); }
+      const h = m && cleanHandle(m[1]);
+      if (h) {
+        ownHandleSource = sel;
+        if (h !== ownHandleCache) { ownHandleCache = h; save(false); }
         return h;
       }
     }
-    return ownHandleCache || '';   // last known handle survives the video modal
+    // A cached handle survives the video modal — but only if it is still
+    // handle-shaped, so a bad value can't be persisted once and trusted forever.
+    const cached = cleanHandle(ownHandleCache);
+    ownHandleSource = cached ? 'cache' : '';
+    return cached;
   }
 
   // What kind of page the URL describes. 'item' is a video/photo permalink —
@@ -441,7 +484,8 @@
   function pathInfo() {
     const m = (location.pathname || '').match(/^\/@([^/?#]+)(?:\/([^/?#]+))?/);
     if (!m) return { kind: 'other', handle: '' };
-    const handle = decodeURIComponent(m[1]).toLowerCase();
+    const handle = cleanHandle(m[1]);
+    if (!handle) return { kind: 'other', handle: '' };   // not a profile path
     const seg = m[2] || '';
     if (!seg) return { kind: 'profile', handle };
     if (seg === 'video' || seg === 'photo') return { kind: 'item', handle };
@@ -488,9 +532,9 @@
     try {
       const a = JSON.parse(s.getItem(ANCHOR_KEY) || 'null');
       const at = a && Number(a.at) || 0;
-      if (a && typeof a.handle === 'string' && a.handle &&
-          Date.now() - at < CFG.anchorIdleMs) {
-        anchor = { handle: a.handle, at };
+      const handle = a && cleanHandle(a.handle);
+      if (handle && Date.now() - at < CFG.anchorIdleMs) {
+        anchor = { handle, at };
         anchorSavedAt = at;
       }
     } catch (e) { /* no anchor */ }
@@ -587,7 +631,7 @@
         `Your Liked grid was last open over ${Math.round(CFG.anchorIdleMs / 3600000)}h ago — ` +
         'reopen your profile\'s Liked tab to re-arm.' };
     }
-    if (kind !== 'viewer') {
+    if (kind === 'none') {
       return { ok: false, stage: 'none', msg:
         "No video viewer is on screen — go back to your Liked grid and open a video from it." };
     }
@@ -1523,8 +1567,45 @@
   }
   readinessTick();
 
+  // What the guard is actually looking at. When the panel refuses and the
+  // reason doesn't match what you see on screen, this says which selector
+  // produced which value — the difference between diagnosing and guessing.
+  function diagnose() {
+    const seen = (list) => list.filter((sel) => {
+      try { return !!visibleMatch([sel]); } catch (e) { return false; }
+    });
+    const rawHref = (() => {
+      for (const sel of ['a[data-e2e="nav-profile"]', '[data-e2e="profile-icon"] a[href^="/@"]']) {
+        const el = document.querySelector(sel);
+        if (el) return `${sel} -> ${el.getAttribute('href')}`;
+      }
+      return '(no signed-in profile link found)';
+    })();
+    const g = pageGuard();
+    const out = {
+      pathname: location.pathname,
+      pathKind: pathInfo().kind,
+      pathHandle: pathInfo().handle || '(not handle-shaped)',
+      ownHandle: ownHandle() || '(unknown)',
+      ownHandleFrom: ownHandleSource || '(nothing matched)',
+      ownHandleRawLink: rawHref,
+      likedTab: likedTabState(),
+      viewerKind: viewerKind(),
+      browseMarkers: seen(BROWSE_SELECTORS),
+      feedMarkers: seen(FEED_SELECTORS),
+      containerMarkers: seen(CONTAINER_SELECTORS),
+      anchor: anchor ? { handle: anchor.handle, ageMs: Date.now() - anchor.at } : null,
+      likeButton: !!findLikeButton(),
+      nextButton: !!findNextButton(),
+      guard: { ok: g.ok, stage: g.stage, msg: g.msg },
+    };
+    console.log('[TTMU] diagnostics\n' + JSON.stringify(out, null, 2));
+    return out;
+  }
+
   // Debug / test hook.
   window.__TTMU__ = {
+    diagnose,
     CFG, P,
     start, stop, resume, pause, setDryRun, setTarget, resetCounters,
     findNextButton, findLikeButton, isLiked, pageGuard, ownHandle,
