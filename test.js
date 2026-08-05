@@ -159,6 +159,11 @@ class El {
     return null;
   }
   getBoundingClientRect() { return this.rect; }
+  contains(other) {
+    let n = other;
+    while (n) { if (n === this) return true; n = n.parentNode; }
+    return false;
+  }
   // Used by the clipboard textarea fallback.
   select() { this.selected = true; }
   remove() {
@@ -307,6 +312,7 @@ function makeEnv(opts) {
     clickFails: () => false,
     nextLabel: 'Next video',
     nextHook: true,
+    splitLayout: false,
     onNext: null,
     random: seededRandom(1),
     firstRun: false,
@@ -404,6 +410,44 @@ function makeEnv(opts) {
     env.goto(env.videoUrl(env.video));
     if (o.onNext) o.onNext(env.video, env);
   };
+
+  // The real desktop detail layout, as observed on tiktok.com:
+  //
+  //   #main-content-video_detail
+  //     div[data-e2e="browse-video"]      <- the PLAYER, and nothing else
+  //     div (right column)
+  //       action rail: like / comment / bookmark
+  //       next-video chevron
+  //       comment list, every comment with its own like button
+  //
+  // The like button is a sibling of the player container, not a descendant.
+  if (o.splitLayout) {
+    const outer = doc.createElement('div');
+    outer.setAttribute('id', 'main-content-video_detail');
+    doc.body.appendChild(outer);
+    container.remove();
+    outer.appendChild(container);
+
+    const rail = doc.createElement('div');
+    outer.appendChild(rail);
+    likeBtn.remove();
+    rail.appendChild(likeBtn);
+    nextBtn.remove();
+    rail.appendChild(nextBtn);
+
+    const drawer = doc.createElement('div');
+    drawer.setAttribute('data-e2e', 'comment-list');
+    outer.appendChild(drawer);
+    for (let i = 0; i < 3; i++) {
+      const c = doc.createElement('button');
+      c.setAttribute('aria-label', 'Like this comment');
+      c.setAttribute('data-e2e', 'comment-like-icon');
+      drawer.appendChild(c);
+      env.commentLike = c;
+    }
+    env.outer = outer;
+    env.rail = rail;
+  }
 
   const store = new Map();
   env.store = store;
@@ -1217,6 +1261,68 @@ test('the like button is found even when a second container is off screen', asyn
   stale.parentNode = env.doc.body;
   const btn = env.api.findLikeButton();
   ok(btn === env.likeBtn, 'must pick the on-screen container');
+});
+
+// ------------------------------ the like button outside the player container
+// data-e2e="browse-video" wraps only the player; the like/comment/bookmark rail
+// is a SIBLING, over in the right-hand column beside the comments. Scoping the
+// search to a single container found nothing on every video and struck out at
+// 6/6 forever with "No like button found".
+test('the like button is found when it lives outside the player container', async () => {
+  const env = makeEnv({ splitLayout: true });
+  ok(env.api.findLikeButton() === env.likeBtn, 'must look past the player container');
+});
+
+test('the next button is found outside the player container too', async () => {
+  const env = makeEnv({ splitLayout: true });
+  ok(env.api.findNextButton() === env.nextBtn, 'the chevron is in the right column');
+});
+
+test('a split-layout run actually unlikes instead of striking out', async () => {
+  const env = makeEnv({ splitLayout: true });
+  env.api.start();
+  await env.clock.advanceUntil(() => env.state().runTotal >= 8, 60 * 60000);
+  const s = env.state();
+  ok(s.runTotal >= 8, `should have unliked 8, got ${s.runTotal} (${s.pauseReason})`);
+  ok(env.api.CFG.strikes > 0 && !s.paused, 'and never hit the no-like-button pause');
+  env.api.stop();
+});
+
+test('widening the root does not let a comment like button through', async () => {
+  const env = makeEnv({ splitLayout: true });
+  // Remove the real like button, leaving only the comment drawer's.
+  env.likeBtn.remove();
+  eq(env.api.findLikeButton(), null, 'must fail closed rather than unlike a comment');
+});
+
+test('a renamed data-e2e like hook is still matched by shape', async () => {
+  const env = makeEnv({ splitLayout: true });
+  env.likeBtn.childNodes = [];                      // drop browse-like-icon
+  env.likeBtn.removeAttribute('aria-label');
+  const icon = env.doc.createElement('span');
+  icon.setAttribute('data-e2e', 'video-like-icon');  // a name we never listed
+  env.likeBtn.appendChild(icon);
+  ok(env.api.findLikeButton() === env.likeBtn, 'shape match, not a literal list');
+});
+
+test('the like COUNT label is never mistaken for the like button', async () => {
+  const env = makeEnv({ splitLayout: true });
+  env.likeBtn.childNodes = [];
+  env.likeBtn.removeAttribute('aria-label');
+  const count = env.doc.createElement('strong');
+  count.setAttribute('data-e2e', 'browse-like-count');
+  env.rail.appendChild(count);
+  eq(env.api.findLikeButton(), null, 'a count is not a button');
+});
+
+test('diagnose distinguishes a scoping bug from a missing button', async () => {
+  const env = makeEnv({ splitLayout: true });
+  const d = env.api.diagnose();
+  const player = d.roots.find((r) => r.e2e === 'browse-video');
+  const detail = d.roots.find((r) => r.id === 'main-content-video_detail');
+  ok(player && !player.hasLike, 'the player root has no like button');
+  ok(detail && detail.hasLike, 'the detail root does');
+  ok(d.likeish.length >= 1, 'and the like-ish elements are listed either way');
 });
 
 // --------------------------------------- regression guard: windowed tracker

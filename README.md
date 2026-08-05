@@ -10,7 +10,7 @@ A Chrome extension / userscript that gradually unlikes videos while you browse y
 - **Processed cap** — a session also breaks after seeing `cap × 2` videos even if it never reaches the unlike cap, so a feed full of already-unliked videos can't spin at full speed forever
 - **Safe state detection** — a video's like state is confirmed via `aria-pressed`, `aria-label`, and icon color before clicking; if the state can't be determined, the video is skipped
 - **Determinacy guard** — if the like state becomes unreadable (a DOM change), the script pauses and says so. It used to keep looping and unlike nothing for hours with the panel still reading "running"
-- **Container-scoped selectors** — every lookup is scoped to the active video container, chosen by how much of the viewport it covers so a stale off-screen container can't win. If no container is on the page, the script finds nothing and pauses rather than clicking something on another part of the page
+- **Container-scoped selectors** — every lookup is scoped to the containers of the video on screen, each chosen by how much of the viewport it covers so a stale off-screen one can't win. If none is on the page, the script finds nothing and pauses rather than clicking something on another part of the page
 - **Verified clicks, rate guard + hard ceiling** — after each click the state is re-read. The script pauses on 2 consecutive failures, 3 failures in the last 10 verifications, *or* 10 failed verifications in total for the run — see [What the guards actually bound](#what-the-guards-actually-bound)
 - **Two-step Start** — a real run permanently unlikes videos, so one stray click can't begin one: the first click arms the button ("Confirm — permanently unlikes") for 5 seconds, the second starts. Dry runs start on a single click
 - **Dry run, on by default on the first run** — counts what it *would* unlike without clicking the like button. Until a dry run has been completed once, the checkbox starts ticked, so the very first **Start** a new user presses is a rehearsal
@@ -158,7 +158,13 @@ Resume is not free. If the script pauses repeatedly for the same *code* it waits
 
 ## How it works
 
-The script finds the active video container first (`data-e2e="browse-video"` and friends), then looks for the like button *inside it* using TikTok's `data-e2e` attributes with an `aria-label` fallback. That fallback rejects any button inside a comment container: on desktop the comment drawer renders *inside* the same video container and its per-comment like buttons carry a "Like"-ish label, so an unqualified `aria-label*="Like"` match could unlike a comment. There is deliberately no document-wide fallback: no container means no button, which means the strike pause fires (6 strikes, ~39s of patience for a slow load) with an accurate message rather than the script quietly operating on some other element.
+The script collects every plausible container for the video on screen (`data-e2e="browse-video"`, `browse-container`, `#main-content-video_detail` and friends), most specific first, then walks that list and takes the first container that actually yields the control it wants.
+
+Walking the list matters, because **the like button is not always inside the smallest container**. On the desktop detail layout `data-e2e="browse-video"` wraps only the player, while the like / comment / bookmark rail and the next-video chevron sit in the right-hand column beside the comments — siblings of the player, not descendants. Committing to one container scoped the search to a subtree the button is not in, so it found nothing on every video and struck out at 6/6 forever.
+
+Within a container the like button is matched by TikTok's `data-e2e` hooks first, then by the *shape* of the hook name (`/(^|-)(un)?like(-icon)?$/`, so a renamed `video-like-icon` still matches while the `browse-like-count` label beside it does not), then by `aria-label` as a last resort.
+
+Widening the search root brings the comments column into scope, and every comment has its own like button — so anything with a comment-flavoured `data-e2e` or class anywhere in its ancestry is rejected outright. Better to miss and strike out than to unlike a comment. There is deliberately no document-wide fallback: no container means no button, which means the strike pause fires (6 strikes, ~39s of patience for a slow load) with an accurate message rather than the script quietly operating on some other element.
 
 The like state itself is read in strict order: `aria-pressed` first, then label wording — the *unliked* forms are tested before any `liked` substring, so "Like video, liked by 1.2M" reads as unliked and social-proof copy can never masquerade as a liked state — and only then the icon fill, anchored to TikTok's actual like red (`#fe2c55` / `rgb(254, 44, 85)`) rather than a loose `rgba(254` match that treated near-white fills as liked and clicked *like* on unliked videos.
 
@@ -218,6 +224,7 @@ Fixed by removing the comparison entirely and replacing it with the anchor descr
 - handles are validated against `[a-z0-9_.]{1,24}` everywhere they are read. The old `[^/?#]+` capture accepted a Windows driver path as a username and armed a run with it
 - a 2-second idle poll re-evaluates the guard, so the panel's verdict tracks single-page navigation instead of freezing at whatever was true when the script was injected
 - **Start** on your Liked grid now says to open a video, instead of starting and burning six no-like-button strikes
+- the like button and the next-video chevron are searched for across *every* candidate container rather than only the first one that matched. `data-e2e="browse-video"` wraps just the player, and both controls live outside it in the right-hand column, so the run struck out at 6/6 on every video with "No like button found". Like hooks are now also matched by name shape rather than a fixed list of literals
 
 ## Disclaimer
 

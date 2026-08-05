@@ -368,20 +368,33 @@
     return h * w;
   }
 
-  function activeContainer() {
-    let best = null;
-    let bestArea = -1;
+  // Every plausible root for the video on screen, most specific first — one per
+  // selector, the most visible match for each.
+  //
+  // This used to commit to a SINGLE container: the first selector with a
+  // visible match won and that was the only place anything was looked for. On
+  // the desktop detail layout `data-e2e="browse-video"` wraps just the player,
+  // while the action rail (like / comment / bookmark) sits in the right-hand
+  // column beside the comments — outside it. So the search was scoped to a
+  // subtree the like button is not in, found nothing on every video, and struck
+  // out at 6/6 forever. Callers now walk the list and take the first root that
+  // actually yields what they are looking for.
+  function activeContainers() {
+    const out = [];
     for (const sel of CONTAINER_SELECTORS) {
-      const found = document.querySelectorAll(sel);
-      for (const el of found) {
+      let best = null;
+      let bestArea = 0;
+      for (const el of document.querySelectorAll(sel)) {
         const a = visibleArea(el);
         if (a > bestArea) { best = el; bestArea = a; }
       }
-      // A selector earlier in the list is more specific: once it matched
-      // anything visible, don't let a looser selector outrank it.
-      if (best && bestArea > 0) return best;
+      if (best) out.push(best);
     }
-    return best;
+    return out;
+  }
+
+  function activeContainer() {
+    return activeContainers()[0] || null;
   }
 
   function visibleMatch(selectors) {
@@ -641,26 +654,59 @@
 
   // ---------------- Like button detection ----------------
 
-  // TikTok's DOM shifts often; try several strategies, most specific first.
-  // No container => no button. There is deliberately NO document-wide fallback:
-  // searching the whole page would let the script act on some other video (or
-  // another page entirely) instead of failing safe into the 6-strike pause.
-  function findLikeButton() {
-    const root = activeContainer();
-    if (!root) return null;
+  // Widening the search root to the whole detail view brings the comments
+  // column with it, and every comment has its own like button. Anything
+  // comment-flavoured is rejected outright — better to miss and strike out than
+  // to unlike a comment. Separate closest() calls rather than one comma
+  // selector, because :closest with a list is not universally supported.
+  function inComments(el) {
+    return !!(el.closest('[data-e2e*="comment"]') ||
+              el.closest('[data-e2e*="Comment"]') ||
+              el.closest('[class*="Comment"]'));
+  }
+
+  // data-e2e names shift between layouts — browse-like-icon, like-icon,
+  // video-like-icon — so this matches the SHAPE of the name instead of a list
+  // of literals that would just be more guesses. It requires the name to END in
+  // "like"/"like-icon", which keeps out the count label ("browse-like-count")
+  // sitting right next to it.
+  const LIKE_E2E_RE = /(^|-)(un)?like(-icon)?$/i;
+
+  // Scoped to one root. Most specific strategy first.
+  function likeButtonIn(root) {
     for (const sel of [
       'span[data-e2e="browse-like-icon"]',   // desktop video viewer
       'span[data-e2e="like-icon"]',          // feed layout
     ]) {
       const el = root.querySelector(sel);
-      if (el) return el.closest('button') || el;
+      if (el && !inComments(el)) return el.closest('button') || el;
     }
-    // aria-label fallback, HARDENED: the desktop comment drawer renders inside
-    // the same video container, and its per-comment like buttons also carry a
-    // "Like"-ish aria-label. A button inside anything comment-flavoured is
-    // rejected outright — better to miss and pause than to unlike a comment.
-    const el = root.querySelector('button[aria-label*="Like" i]');
-    if (el && !el.closest('[data-e2e*="comment"]')) return el;
+    // Shape-matched data-e2e, for a layout that renamed the hook.
+    for (const el of root.querySelectorAll('[data-e2e]')) {
+      const name = el.getAttribute('data-e2e') || '';
+      if (!LIKE_E2E_RE.test(name) || /comment/i.test(name)) continue;
+      if (inComments(el)) continue;
+      return el.closest('button') || el;
+    }
+    // aria-label fallback, last and most permissive.
+    for (const el of root.querySelectorAll('button[aria-label*="Like" i]')) {
+      if (!inComments(el)) return el;
+    }
+    return null;
+  }
+
+  // TikTok's DOM shifts often; try several strategies, most specific first.
+  // No container => no button. There is deliberately NO document-wide fallback:
+  // searching the whole page would let the script act on some other video (or
+  // another page entirely) instead of failing safe into the 6-strike pause.
+  //
+  // Every candidate root is tried, innermost first, because the like button is
+  // not always inside the smallest one — see activeContainers().
+  function findLikeButton() {
+    for (const root of activeContainers()) {
+      const btn = likeButtonIn(root);
+      if (btn) return btn;
+    }
     return null;
   }
 
@@ -732,9 +778,10 @@
   // cause is a non-English TikTok UI, which deserves its own message.
   let lastNextMiss = '';
 
-  function findNextButton() {
-    const scope = activeContainer();
-    if (!scope) { lastNextMiss = 'no-container'; return null; }
+  // Same widening as findLikeButton: the next/previous chevrons sit between the
+  // player and the comments column, outside the container that wraps just the
+  // video, so a single-root search never saw them either.
+  function nextButtonIn(scope) {
     // Most specific: TikTok's own hooks. Still deny-checked in case the hook
     // is reused on a control that does something else.
     for (const sel of [
@@ -742,7 +789,7 @@
       'button[data-e2e="browse-video-next"]',
     ]) {
       const el = scope.querySelector(sel);
-      if (el && !el.disabled && !vetoed(labelOf(el))) { lastNextMiss = ''; return el; }
+      if (el && !el.disabled && !vetoed(labelOf(el))) return { btn: el, labelled: 1 };
     }
     let labelled = 0;
     for (const b of scope.querySelectorAll('button')) {
@@ -751,7 +798,19 @@
       if (!label) continue;
       labelled++;
       if (vetoed(label)) continue;
-      if (NEXT_ALLOW_RE.test(label)) { lastNextMiss = ''; return b; }
+      if (NEXT_ALLOW_RE.test(label)) return { btn: b, labelled };
+    }
+    return { btn: null, labelled };
+  }
+
+  function findNextButton() {
+    const roots = activeContainers();
+    if (!roots.length) { lastNextMiss = 'no-container'; return null; }
+    let labelled = 0;
+    for (const scope of roots) {
+      const r = nextButtonIn(scope);
+      if (r.btn) { lastNextMiss = ''; return r.btn; }
+      labelled = Math.max(labelled, r.labelled);
     }
     lastNextMiss = labelled ? 'no-match' : 'no-labels';
     return null;
@@ -1598,6 +1657,42 @@
       likeButton: !!findLikeButton(),
       nextButton: !!findNextButton(),
       guard: { ok: g.ok, stage: g.stage, msg: g.msg },
+      // Which roots are on screen and whether each actually contains the
+      // controls. A root that is present but yields nothing is the signature of
+      // a scoping bug rather than a missing button.
+      roots: activeContainers().map((el) => ({
+        e2e: el.getAttribute('data-e2e') || null,
+        id: el.getAttribute('id') || null,
+        cls: (el.getAttribute('class') || '').slice(0, 80) || null,
+        area: Math.round(visibleArea(el)),
+        hasLike: !!likeButtonIn(el),
+        hasNext: !!nextButtonIn(el).btn,
+      })),
+      // Every like-ish element on the page, in or out of scope. If findLikeButton
+      // is null but this list isn't, the selector is right and the SCOPE is wrong.
+      likeish: (() => {
+        const roots = activeContainers();
+        const seen = [];
+        const add = (el) => {
+          if (seen.some((s) => s.el === el)) return;
+          seen.push({
+            el,
+            tag: el.tagName,
+            e2e: el.getAttribute('data-e2e') || null,
+            aria: (el.getAttribute('aria-label') || '').slice(0, 60) || null,
+            pressed: el.getAttribute('aria-pressed'),
+            inComments: inComments(el),
+            inRoot: roots.findIndex((r) => r.contains(el)),
+          });
+        };
+        try {
+          for (const el of document.querySelectorAll('[data-e2e]')) {
+            if (/like/i.test(el.getAttribute('data-e2e') || '')) add(el);
+          }
+          for (const el of document.querySelectorAll('button[aria-label*="ike"]')) add(el);
+        } catch (e) { /* best effort */ }
+        return seen.slice(0, 20).map(({ el, ...rest }) => rest);
+      })(),
     };
     console.log('[TTMU] diagnostics\n' + JSON.stringify(out, null, 2));
     return out;
