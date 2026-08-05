@@ -272,8 +272,15 @@ function seededRandom(seed) {
 // ------------------------------------------------------------ page + sandbox
 /**
  * opts:
- *   href          initial URL (default: own liked-feed video)
+ *   href          initial URL (default: the first video of the liked feed)
  *   handle        own handle rendered into the nav-profile link ('' = none)
+ *   author        (i) => handle that POSTED video i. Videos in a liked feed are
+ *                 other people's — that is what liking is — so the URL is
+ *                 /@<creator>/video/<id> and the handle in it is never yours.
+ *   anchored      true = arrive as if from your own Liked grid (the per-tab
+ *                 anchor is pre-seeded). false = a cold landing on the URL.
+ *   feedMarkup    true = also render a recommendation-feed container, i.e. the
+ *                 For You page with the URL rewritten to the playing video
  *   likedTab      'yes' | 'no' | null  (aria-selected on the liked tab)
  *   readable      (i) => bool   can the like state be read for video i
  *   clickFails    (i) => bool   does the click fail to flip video i
@@ -287,10 +294,14 @@ function seededRandom(seed) {
  *   clipboard     'ok' | 'reject' | 'none' — navigator.clipboard behaviour
  */
 const STORE_KEY = 'ttmu.v1';
+const ANCHOR_KEY = 'ttmu.anchor.v1';
 function makeEnv(opts) {
   const o = Object.assign({
-    href: 'https://www.tiktok.com/@me/video/1',
+    href: null,
     handle: 'me',
+    author: (i) => `creator${i}`,
+    anchored: true,
+    feedMarkup: false,
     likedTab: 'yes',
     readable: () => true,
     clickFails: () => false,
@@ -314,7 +325,13 @@ function makeEnv(opts) {
     location.pathname = u.split(/[?#]/)[0] || '/';
     location.hostname = 'www.tiktok.com';
   };
-  env.goto(o.href);
+  // The permalink of the i-th video in the liked feed. The handle is the
+  // CREATOR's: an earlier harness wrote /@me/video/i here, which quietly
+  // modelled a liked feed in which the user had posted every video themselves —
+  // the one shape in which the old author-vs-owner URL check could pass.
+  env.videoUrl = (i) => `https://www.tiktok.com/@${o.author(i)}/video/${1000 + i}`;
+  env.profileUrl = (h) => `https://www.tiktok.com/@${h || o.handle}`;
+  env.goto(o.href || env.videoUrl(1));
 
   // Own-profile link (what the page guard uses to learn the handle).
   if (o.handle) {
@@ -335,6 +352,16 @@ function makeEnv(opts) {
   container.setAttribute('data-e2e', 'browse-video');
   doc.body.appendChild(container);
   env.container = container;
+
+  // For You renders its own list container AND rewrites the address bar to the
+  // playing video's /@creator/video/<id> permalink, so the URL alone cannot
+  // tell it apart from a liked-feed video.
+  if (o.feedMarkup) {
+    const feed = doc.createElement('div');
+    feed.setAttribute('data-e2e', 'recommend-list-item-container');
+    doc.body.appendChild(feed);
+    env.feed = feed;
+  }
 
   const likeBtn = doc.createElement('button');
   const likeIcon = doc.createElement('span');
@@ -374,12 +401,20 @@ function makeEnv(opts) {
     env.video++;
     env.liked = true;
     paint();
-    env.goto(`https://www.tiktok.com/@${o.handle || 'me'}/video/${env.video}`);
+    env.goto(env.videoUrl(env.video));
     if (o.onNext) o.onNext(env.video, env);
   };
 
   const store = new Map();
   env.store = store;
+
+  // sessionStorage is per-tab, which is exactly the lifetime the liked-feed
+  // anchor wants: it survives a reload of the run and dies with the tab.
+  const sessionStore = new Map();
+  env.sessionStore = sessionStore;
+  if (o.anchored && o.handle) {
+    sessionStore.set(ANCHOR_KEY, JSON.stringify({ handle: o.handle, at: clock.now }));
+  }
   // Unless a test asks for a virgin profile, pre-seed the store as an
   // experienced user: a dry run has been done and the checkbox is off. The
   // script's own first-run default (dry run ON) is covered by its own tests.
@@ -410,6 +445,11 @@ function makeEnv(opts) {
       getItem: (k) => (store.has(k) ? store.get(k) : null),
       setItem: (k, v) => store.set(k, String(v)),
       removeItem: (k) => store.delete(k),
+    },
+    sessionStorage: {
+      getItem: (k) => (sessionStore.has(k) ? sessionStore.get(k) : null),
+      setItem: (k, v) => sessionStore.set(k, String(v)),
+      removeItem: (k) => sessionStore.delete(k),
     },
     KeyboardEvent: class { constructor(type, init) { Object.assign(this, init || {}); this.type = type; } },
     setTimeout: (fn, ms) => clock.setTimeout(fn, ms),
@@ -458,7 +498,7 @@ test('page guard refuses to start on a hashtag feed', async () => {
 });
 
 test("page guard refuses to start on someone else's profile", async () => {
-  const env = makeEnv({ href: 'https://www.tiktok.com/@stranger/video/9', handle: 'me', likedTab: null });
+  const env = makeEnv({ href: 'https://www.tiktok.com/@stranger', handle: 'me', likedTab: null });
   env.api.start();
   await env.clock.advanceUntil(null, 60000);
   eq(env.state().running, false, "must not run on another user's profile");
@@ -473,6 +513,32 @@ test('page guard refuses when the Liked tab is not the selected tab', async () =
   eq(env.state().running, false, 'must not run with the Liked tab unselected');
 });
 
+// ------------------------------------------------------- P0 the author's URL
+// THE regression test. Every video in a liked feed was posted by someone else,
+// so its permalink is /@<creator>/video/<id>. A guard that compares that handle
+// to the signed-in user's refuses on every video in the feed and the script
+// never runs at all — it only ever passes on a video you both posted and liked.
+test("page guard accepts a liked video posted by someone else (it always is)", async () => {
+  const env = makeEnv({ handle: 'me', author: () => 'somecreator' });
+  includes(env.api.pathInfo().handle, 'somecreator', 'the URL handle is the creator');
+  eq(env.api.ownHandle(), 'me', 'and it is not the signed-in user');
+  const g = env.api.pageGuard();
+  eq(g.ok, true, `a liked video by another creator must be accepted (${g.msg})`);
+  eq(g.stage, 'viewer', 'stage');
+});
+
+test('a real run works its way through videos posted by other people', async () => {
+  const env = makeEnv({ handle: 'me', author: (i) => `creator${i}` });
+  env.api.start();
+  await env.clock.advanceUntil(() => env.state().runTotal >= 12, 60 * 60000);
+  const s = env.state();
+  ok(s.runTotal >= 12, `should have unliked 12, got ${s.runTotal}`);
+  ok(!s.paused, `must not pause on a normal feed (${s.pauseReason})`);
+  ok(env.api.unlikedUrls().every((u) => u.indexOf('/@me/') === -1),
+    'every unliked video belongs to another creator');
+  env.api.stop();
+});
+
 test('page guard allows the own liked feed', async () => {
   const env = makeEnv({});
   const g = env.api.pageGuard();
@@ -480,6 +546,110 @@ test('page guard allows the own liked feed', async () => {
   env.api.start();
   eq(env.state().running, true, 'should be running');
   env.api.stop();
+});
+
+// ------------------------------------------------- P0 what replaces the check
+// The URL cannot prove whose liked feed this is, so the proof is taken on the
+// profile page — where the path IS yours — and carried in a per-tab anchor.
+test('the own Liked grid arms the anchor', async () => {
+  const env = makeEnv({ href: 'https://www.tiktok.com/@me', anchored: false });
+  // Nothing was pre-seeded: the readiness poll evaluating the guard on arrival
+  // is what arms it, and that is the only place arming ever happens.
+  eq(env.api.anchor().handle, 'me', 'the anchor is armed');
+  includes(env.sessionStore.get('ttmu.anchor.v1'), '"handle":"me"', 'and persisted per tab');
+  includes(env.logText(), 'Liked feed armed', 'and said so, once');
+  const g = env.api.pageGuard();
+  eq(g.ok, false, 'the grid itself has nothing to unlike');
+  eq(g.stage, 'profile', 'but it is the arming stage, not a wrong page');
+});
+
+test("a stranger's profile drops an anchor rather than leaving it armed", async () => {
+  const env = makeEnv({ href: 'https://www.tiktok.com/@stranger', handle: 'me', likedTab: null });
+  eq(env.api.anchor(), null, 'walking onto another profile disarms the run');
+});
+
+test('Start on the Liked grid says to open a video, not "wrong page"', async () => {
+  const env = makeEnv({ href: 'https://www.tiktok.com/@me', anchored: false });
+  env.api.start();
+  eq(env.state().running, false, 'nothing to unlike on the grid');
+  includes(env.logText(), 'Open the first video', 'tells the user the one thing left to do');
+});
+
+test('the idle poll arms the anchor after an in-app walk to the Liked tab', async () => {
+  // No reload happens in a single-page app, so nothing else would ever
+  // re-evaluate the guard between the For You feed and the liked feed.
+  const env = makeEnv({ href: 'https://www.tiktok.com/foryou', anchored: false, likedTab: null });
+  await env.clock.advanceUntil(null, 5000);
+  eq(env.api.anchor(), null, 'For You must not arm anything');
+  env.goto('https://www.tiktok.com/@me');
+  env.doc.body.appendChild((() => {
+    const t = env.doc.createElement('p');
+    t.setAttribute('data-e2e', 'liked-tab');
+    t.setAttribute('aria-selected', 'true');
+    return t;
+  })());
+  await env.clock.advanceUntil(() => env.api.anchor() !== null, 10000);
+  eq(env.api.anchor().handle, 'me', 'walking to the Liked tab arms it');
+  env.goto(env.videoUrl(1));
+  await env.clock.advanceUntil(null, 5000);
+  eq(env.api.pageGuard().ok, true, 'and opening a video from it is now allowed');
+});
+
+test('a cold landing on a liked-feed video URL is refused, not guessed at', async () => {
+  const env = makeEnv({ anchored: false, likedTab: null });
+  env.api.start();
+  await env.clock.advanceUntil(null, 60000);
+  eq(env.state().running, false, 'no anchor, no run');
+  includes(env.logText(), "Can't confirm this video came from your own Liked feed", 'says why');
+  eq(env.clicks, 0, 'no like button was clicked');
+});
+
+test('a For You feed rewritten to a video URL is refused even with an anchor', async () => {
+  // The dangerous lookalike: same permalink shape, same viewer chrome, an
+  // anchor still fresh from the Liked grid earlier in this tab.
+  const env = makeEnv({ feedMarkup: true, likedTab: null, anchored: true });
+  eq(env.api.viewerKind(), 'feed', 'the recommendation container is detected');
+  const g = env.api.pageGuard();
+  eq(g.ok, false, 'must not treat For You as the liked feed');
+  includes(g.msg, 'recommendation feed', 'names what it found');
+  eq(env.api.anchor(), null, 'and the stale anchor is dropped');
+  env.api.start();
+  await env.clock.advanceUntil(null, 60000);
+  eq(env.clicks, 0, 'nothing was clicked');
+});
+
+test('a stale anchor expires instead of authorising forever', async () => {
+  // The window measures time since the guard last PASSED, so a tab parked on
+  // For You for half a day cannot come back and still count as armed. A tab
+  // left on the liked feed itself keeps re-confirming and stays valid.
+  const env = makeEnv({ likedTab: null });
+  eq(env.api.pageGuard().ok, true, 'fresh anchor works');
+  env.goto('https://www.tiktok.com/foryou');
+  await env.clock.advanceUntil(null, env.api.CFG.anchorIdleMs + 60000);
+  env.goto(env.videoUrl(1));
+  const g = env.api.pageGuard();
+  eq(g.ok, false, 'an anchor left idle past the window must not authorise a run');
+  includes(g.msg, 're-arm', 'says how to fix it');
+});
+
+test('a liked feed left open keeps re-confirming and does not expire', async () => {
+  const env = makeEnv({ likedTab: null });
+  await env.clock.advanceUntil(null, env.api.CFG.anchorIdleMs + 60000);
+  eq(env.api.pageGuard().ok, true, 'continuously verified evidence must not go stale');
+});
+
+test('ownHandle never learns the signed-in user from a profile-detail link', async () => {
+  // `user-detail-profile` points at whoever's profile is being VIEWED. Trusting
+  // it cached a stranger as "you", after which their profile read as your own.
+  const env = makeEnv({ href: 'https://www.tiktok.com/@stranger', handle: '', likedTab: null, anchored: false });
+  const a = env.doc.createElement('a');
+  a.setAttribute('data-e2e', 'user-detail-profile');
+  a.setAttribute('href', '/@stranger');
+  env.doc.body.appendChild(a);
+  eq(env.api.ownHandle(), '', "a viewed profile is not the viewer's own");
+  const g = env.api.pageGuard();
+  eq(g.ok, false, 'and with no known account nothing may run');
+  includes(g.msg, 'which account is signed in', 'says what is missing');
 });
 
 test('page guard pauses mid-run when the feed changes underneath it', async () => {
