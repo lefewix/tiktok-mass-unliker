@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         TikTok Mass Unliker
 // @namespace    flxtcg.tools
-// @version      2.0.0
-// @description  Gradually unlikes videos while browsing your own Liked feed. Liked-feed page guard, confirm-armed start, dry-run-by-default first run, paced clicking, windowed + cumulative click verification, container-scoped selectors, session caps, target count, unliked-URL export, and a movable start/stop panel.
+// @version      2.1.0
+// @description  Gradually unlikes videos while browsing your own Liked feed. Anchored liked-feed page guard, confirm-armed start, dry-run-by-default first run, paced clicking, windowed + cumulative click verification, container-scoped selectors, session caps, target count, unliked-URL export, and a movable start/stop panel.
 // @author       Felix Wang
 // @license      MIT
 // @match        https://www.tiktok.com/*
@@ -53,6 +53,11 @@
     detConsecutive: 4,        //   fast path: this many unreadable in a row
 
     sessionIdleMs: 12 * 3600000, // persisted session window expires after 12h idle
+    // The liked-feed anchor (see the page guard) goes stale after this much
+    // IDLE time. A running loop re-confirms it every iteration, so only real
+    // idling counts against it.
+    anchorIdleMs: 4 * 3600000,
+    readyPollMs: 2000,        // how often the idle readiness/arming poll runs
     resumeBackoffMs: 30000,   // first backoff after a repeated same-reason pause
     resumeBackoffMaxMs: 5 * 60000,
     resumeGiveUpAfter: 5,     // refuse to resume after this many identical pauses
@@ -313,67 +318,7 @@
     updateUI();
   }
 
-  // ---------------- Page guard ----------------
-  // The container selectors below match TikTok's video viewer EVERYWHERE — For
-  // You, hashtag pages, someone else's profile. Without this guard, reloading
-  // onto For You and pressing Start from habit strips likes off the wrong feed
-  // at ~500/hour. Nothing starts, and nothing keeps running, unless the
-  // location still looks like the user's own liked view.
-  const HANDLE_RE = /^\/@([^/?#]+)/;
-
-  function ownHandle() {
-    for (const sel of [
-      'a[data-e2e="nav-profile"]',
-      '[data-e2e="profile-icon"] a[href^="/@"]',
-      'a[data-e2e="user-detail-profile"]',
-    ]) {
-      const el = document.querySelector(sel);
-      const href = el && (el.getAttribute('href') || '');
-      const m = href && href.match(HANDLE_RE);
-      if (m) {
-        const h = decodeURIComponent(m[1]).toLowerCase();
-        if (h && h !== ownHandleCache) { ownHandleCache = h; save(false); }
-        return h;
-      }
-    }
-    return ownHandleCache || '';   // last known handle survives the video modal
-  }
-
-  // 'yes' | 'no' | 'unknown'. Unknown is never a veto on its own — the tab strip
-  // is not always rendered behind the video modal.
-  function likedTabState() {
-    const tab = document.querySelector('[data-e2e="liked-tab"]');
-    if (!tab) return 'unknown';
-    const sel = tab.getAttribute('aria-selected')
-      ?? tab.closest('[aria-selected]')?.getAttribute('aria-selected');
-    if (sel === 'true') return 'yes';
-    if (sel === 'false') return 'no';
-    return 'unknown';
-  }
-
-  // { ok, msg }. Called before start() and again on every loop iteration.
-  function pageGuard() {
-    const m = (location.pathname || '').match(HANDLE_RE);
-    if (!m) {
-      return { ok: false, msg: 'Not on a profile page — this looks like For You, a hashtag or search feed. ' +
-        'Open your own profile, pick the Liked tab, then open a video from it.' };
-    }
-    const here = decodeURIComponent(m[1]).toLowerCase();
-    const own = ownHandle();
-    if (own && here !== own) {
-      return { ok: false, msg: `This is @${here}'s profile, not yours (@${own}) — refusing to unlike here.` };
-    }
-    if (likedTabState() === 'no') {
-      return { ok: false, msg: 'The Liked tab is not the selected tab on this profile — open Liked first.' };
-    }
-    if (!own) {
-      return { ok: false, msg: "Can't confirm this is your own Liked feed — your profile link wasn't found on the page. " +
-        'Open your profile, pick the Liked tab, then open a video from it.' };
-    }
-    return { ok: true, msg: '' };
-  }
-
-  // ---------------- Like button detection ----------------
+  // ---------------- Viewer detection ----------------
   // Everything is scoped to the active video container so an open comment
   // drawer can never hand us a comment's like button.
   const CONTAINER_SELECTORS = [
@@ -382,6 +327,31 @@
     '#main-content-video_detail',
     'div[class*="DivBrowserModeContainer"]',
     'div[class*="DivVideoDetailContainer"]',
+  ];
+
+  // Browse mode: TikTok opened this video FROM A LIST (a profile grid, search
+  // results). These are unambiguous — the recommendation feed never renders
+  // them — so a match here is proof of browse mode and outranks everything.
+  const BROWSE_SELECTORS = [
+    'div[data-e2e="browse-video"]',
+    'div[data-e2e="browse-container"]',
+    'div[class*="DivBrowserModeContainer"]',
+  ];
+
+  // Recommendation feeds render the same viewer chrome as the liked feed AND
+  // rewrite the address bar to the playing video's canonical /@author/video/id
+  // path, so on a URL basis a For You video is indistinguishable from a liked
+  // one. These markers are the tie-breaker when no browse marker is present.
+  //
+  // ONLY high-confidence data-e2e hooks belong here. `div[class*="DivVideoFeed"]`
+  // and `div[class*="DivRecommend"]` were in this list and were guesses: the
+  // liked-feed modal IS a vertical video feed component, so a hashed class like
+  // DivVideoFeedV2 renders there too and the veto fired on the one page the
+  // whole script exists to run on. A veto built on a substring guess fails
+  // closed in the wrong place.
+  const FEED_SELECTORS = [
+    '[data-e2e="recommend-list-item-container"]',
+    '[data-e2e="feed-video"]',
   ];
 
   // In a multi-item feed the first document-wide match is not necessarily the
@@ -398,42 +368,345 @@
     return h * w;
   }
 
-  function activeContainer() {
-    let best = null;
-    let bestArea = -1;
+  // Every plausible root for the video on screen, most specific first — one per
+  // selector, the most visible match for each.
+  //
+  // This used to commit to a SINGLE container: the first selector with a
+  // visible match won and that was the only place anything was looked for. On
+  // the desktop detail layout `data-e2e="browse-video"` wraps just the player,
+  // while the action rail (like / comment / bookmark) sits in the right-hand
+  // column beside the comments — outside it. So the search was scoped to a
+  // subtree the like button is not in, found nothing on every video, and struck
+  // out at 6/6 forever. Callers now walk the list and take the first root that
+  // actually yields what they are looking for.
+  function activeContainers() {
+    const out = [];
     for (const sel of CONTAINER_SELECTORS) {
-      const found = document.querySelectorAll(sel);
-      for (const el of found) {
+      let best = null;
+      let bestArea = 0;
+      for (const el of document.querySelectorAll(sel)) {
         const a = visibleArea(el);
         if (a > bestArea) { best = el; bestArea = a; }
       }
-      // A selector earlier in the list is more specific: once it matched
-      // anything visible, don't let a looser selector outrank it.
-      if (best && bestArea > 0) return best;
+      if (best) out.push(best);
     }
-    return best;
+    return out;
+  }
+
+  function activeContainer() {
+    return activeContainers()[0] || null;
+  }
+
+  function visibleMatch(selectors) {
+    for (const sel of selectors) {
+      for (const el of document.querySelectorAll(sel)) {
+        if (visibleArea(el) > 0) return el;
+      }
+    }
+    return null;
+  }
+
+  // 'browse' | 'feed' | 'viewer' | 'none'.
+  //
+  // Proof beats inference: a browse-mode marker means the video was opened from
+  // a list, which the recommendation feed never is, so it settles the question
+  // outright. The feed markers only arbitrate the ambiguous case — a bare
+  // detail container with nothing saying where it came from.
+  function viewerKind() {
+    if (visibleMatch(BROWSE_SELECTORS)) return 'browse';
+    if (visibleMatch(FEED_SELECTORS)) return 'feed';
+    if (visibleMatch(CONTAINER_SELECTORS)) return 'viewer';
+    return 'none';
+  }
+
+  // ---------------- Page guard ----------------
+  // The container selectors above match TikTok's video viewer EVERYWHERE — For
+  // You, hashtag pages, someone else's profile. Without this guard, reloading
+  // onto For You and pressing Start from habit strips likes off the wrong feed
+  // at ~500/hour. Nothing starts, and nothing keeps running, unless the page
+  // still looks like the user's own liked view.
+  //
+  // WHAT THE URL CAN AND CANNOT TELL US
+  // A video opened from your Liked tab lives at /@<creator>/video/<id>: the
+  // handle in the path is the video's AUTHOR, never yours — your liked feed is
+  // full of other people's videos, that is what liking is. An earlier guard
+  // compared that handle to your own and refused with "this is @x's profile,
+  // not yours" on every single video, so the script could never run at all. It
+  // only ever passed on a video you had both posted and liked.
+  //
+  // The URL therefore cannot answer "is this my liked feed?". So it is answered
+  // where it IS answerable — on your own profile, where the path is yours and
+  // the Liked tab is visibly selected — and that fact is carried into the
+  // viewer as an ANCHOR. The anchor is per-tab (sessionStorage): it survives a
+  // reload of the run, and it dies with the tab rather than following the user
+  // into a fresh window that landed on For You.
+  const HANDLE_RE = /^\/@([^/?#]+)/;
+  const ANCHOR_KEY = 'ttmu.anchor.v1';
+
+  // A TikTok handle is letters, digits, underscores and periods, up to 24
+  // characters. `[^/?#]+` alone accepts backslashes, spaces and punctuation,
+  // which is how a Windows driver path — @DriverStore\FileRepository\…\x.sys —
+  // was once accepted as a username and armed the run. Anything that is not
+  // shaped like a handle is not a handle, whatever produced it.
+  const HANDLE_SHAPE = /^[a-z0-9_.]{1,24}$/;
+
+  // '' when the string is absent or not handle-shaped. Everything that reads a
+  // handle goes through here, so a malformed one can never reach the guard.
+  function cleanHandle(raw) {
+    if (!raw) return '';
+    let h = String(raw);
+    try { h = decodeURIComponent(h); } catch (e) { /* keep the raw form */ }
+    h = h.toLowerCase();
+    return HANDLE_SHAPE.test(h) ? h : '';
+  }
+
+  // Which selector last produced the own handle, for diagnose().
+  let ownHandleSource = '';
+
+  function ownHandle() {
+    // Signed-in-user chrome ONLY. `a[data-e2e="user-detail-profile"]` used to
+    // be in this list and is a PROFILE-DETAIL link: on a stranger's profile it
+    // points at THEM, so it cached a stranger as "you" — after which the guard
+    // would have happily agreed that their profile was your own.
+    for (const sel of [
+      'a[data-e2e="nav-profile"]',
+      '[data-e2e="nav-profile"] a[href^="/@"]',
+      '[data-e2e="profile-icon"] a[href^="/@"]',
+      'a[data-e2e="profile-icon"]',
+    ]) {
+      const el = document.querySelector(sel);
+      const href = el && (el.getAttribute('href') || '');
+      const m = href && href.match(HANDLE_RE);
+      const h = m && cleanHandle(m[1]);
+      if (h) {
+        ownHandleSource = sel;
+        if (h !== ownHandleCache) { ownHandleCache = h; save(false); }
+        return h;
+      }
+    }
+    // A cached handle survives the video modal — but only if it is still
+    // handle-shaped, so a bad value can't be persisted once and trusted forever.
+    const cached = cleanHandle(ownHandleCache);
+    ownHandleSource = cached ? 'cache' : '';
+    return cached;
+  }
+
+  // What kind of page the URL describes. 'item' is a video/photo permalink —
+  // the handle in it belongs to the AUTHOR and is deliberately never compared
+  // to the user's own.
+  function pathInfo() {
+    const m = (location.pathname || '').match(/^\/@([^/?#]+)(?:\/([^/?#]+))?/);
+    if (!m) return { kind: 'other', handle: '' };
+    const handle = cleanHandle(m[1]);
+    if (!handle) return { kind: 'other', handle: '' };   // not a profile path
+    const seg = m[2] || '';
+    if (!seg) return { kind: 'profile', handle };
+    if (seg === 'video' || seg === 'photo') return { kind: 'item', handle };
+    return { kind: 'other', handle };   // /@x/live and friends
+  }
+
+  // 'yes' | 'no' | 'unknown'. Unknown is never a veto on its own — the tab strip
+  // is not always rendered behind the video modal.
+  function likedTabState() {
+    const tab = document.querySelector('[data-e2e="liked-tab"]');
+    if (!tab) return 'unknown';
+    const sel = tab.getAttribute('aria-selected')
+      ?? tab.closest('[aria-selected]')?.getAttribute('aria-selected');
+    if (sel === 'true') return 'yes';
+    if (sel === 'false') return 'no';
+    return 'unknown';
+  }
+
+  // ---- Liked-feed anchor (per tab) ----
+  let anchor = null;        // { handle, at }
+  let anchorSavedAt = 0;
+
+  function anchorStore() {
+    try {
+      return typeof sessionStorage !== 'undefined' ? sessionStorage : null;
+    } catch (e) {
+      return null;   // storage partitioning / disabled cookies
+    }
+  }
+
+  function writeAnchor() {
+    const s = anchorStore();
+    if (!s) return;
+    try {
+      if (anchor) s.setItem(ANCHOR_KEY, JSON.stringify(anchor));
+      else s.removeItem(ANCHOR_KEY);
+      anchorSavedAt = Date.now();
+    } catch (e) { /* in-memory only */ }
+  }
+
+  function loadAnchor() {
+    const s = anchorStore();
+    if (!s) return;
+    try {
+      const a = JSON.parse(s.getItem(ANCHOR_KEY) || 'null');
+      const at = a && Number(a.at) || 0;
+      const handle = a && cleanHandle(a.handle);
+      if (handle && Date.now() - at < CFG.anchorIdleMs) {
+        anchor = { handle, at };
+        anchorSavedAt = at;
+      }
+    } catch (e) { /* no anchor */ }
+  }
+
+  function armAnchor(handle) {
+    const isNew = !anchor || anchor.handle !== handle;
+    anchor = { handle, at: Date.now() };
+    writeAnchor();
+    if (isNew) log(`Liked feed armed for @${handle}.`);
+  }
+
+  // Called on every passing guard check, so the staleness window measures IDLE
+  // time rather than run length. The persisted copy is throttled — the loop
+  // calls this once per video and sessionStorage does not need the churn.
+  function touchAnchor() {
+    if (!anchor) return;
+    anchor.at = Date.now();
+    if (anchor.at - anchorSavedAt > 60000) writeAnchor();
+  }
+
+  function clearAnchor() {
+    if (!anchor) return;
+    anchor = null;
+    writeAnchor();
+  }
+
+  // { ok, stage, msg }. Called before start(), on every loop iteration, and on
+  // the idle readiness poll — the poll is what arms the anchor when the user
+  // walks to their Liked tab without ever reloading the page.
+  //
+  // stage: 'viewer' (ok to run) | 'profile' (own Liked grid, nothing to unlike
+  // yet, anchor armed) | 'none'.
+  function pageGuard() {
+    const own = ownHandle();
+    const info = pathInfo();
+
+    if (!own) {
+      return { ok: false, stage: 'none', msg:
+        "Can't tell which account is signed in — your own profile link isn't on the page. " +
+        'Make sure you are logged in, open your profile, then pick the Liked tab.' };
+    }
+
+    // --- your own profile: the one place the URL proves whose feed this is ---
+    if (info.kind === 'profile') {
+      if (info.handle !== own) {
+        clearAnchor();
+        return { ok: false, stage: 'none', msg:
+          `This is @${info.handle}'s profile, not yours (@${own}) — open your own profile.` };
+      }
+      const tab = likedTabState();
+      if (tab !== 'yes') {
+        return { ok: false, stage: 'none', msg: tab === 'no'
+          ? 'The Liked tab is not the selected tab on your profile — open Liked first.'
+          : "Can't see a selected Liked tab on this profile — open the Liked tab." };
+      }
+      armAnchor(own);
+      return { ok: false, stage: 'profile', msg:
+        'the video viewer is not open — open a video from your Liked grid.' };
+    }
+
+    if (info.kind !== 'item') {
+      return { ok: false, stage: 'none', msg:
+        'Not on a profile or on a video opened from one — this looks like For You, a hashtag or a ' +
+        'search feed. Open your own profile, pick the Liked tab, then open a video from it.' };
+    }
+
+    // --- a video permalink. info.handle is the CREATOR's and is NOT checked ---
+    const kind = viewerKind();
+    if (kind === 'feed') {
+      clearAnchor();
+      return { ok: false, stage: 'none', msg:
+        'This is a recommendation feed showing a video URL, not your Liked feed — For You and ' +
+        'hashtag feeds put /@creator/video/… in the address bar too. Open your Liked tab instead.' };
+    }
+    if (likedTabState() === 'no') {
+      clearAnchor();
+      return { ok: false, stage: 'none', msg:
+        'The Liked tab is no longer selected on the profile behind this video — open Liked first.' };
+    }
+    if (!anchor) {
+      return { ok: false, stage: 'none', msg:
+        `Can't confirm this video came from your own Liked feed. Open your profile (@${own}), ` +
+        'pick the Liked tab, then open a video from the grid — that is what arms the run.' };
+    }
+    if (anchor.handle !== own) {
+      clearAnchor();
+      return { ok: false, stage: 'none', msg:
+        `The signed-in account changed to @${own} since the Liked feed was armed — reopen your Liked tab.` };
+    }
+    if (Date.now() - anchor.at > CFG.anchorIdleMs) {
+      clearAnchor();
+      return { ok: false, stage: 'none', msg:
+        `Your Liked grid was last open over ${Math.round(CFG.anchorIdleMs / 3600000)}h ago — ` +
+        'reopen your profile\'s Liked tab to re-arm.' };
+    }
+    if (kind === 'none') {
+      return { ok: false, stage: 'none', msg:
+        "No video viewer is on screen — go back to your Liked grid and open a video from it." };
+    }
+    touchAnchor();
+    return { ok: true, stage: 'viewer', msg: '' };
+  }
+
+  // ---------------- Like button detection ----------------
+
+  // Widening the search root to the whole detail view brings the comments
+  // column with it, and every comment has its own like button. Anything
+  // comment-flavoured is rejected outright — better to miss and strike out than
+  // to unlike a comment. Separate closest() calls rather than one comma
+  // selector, because :closest with a list is not universally supported.
+  function inComments(el) {
+    return !!(el.closest('[data-e2e*="comment"]') ||
+              el.closest('[data-e2e*="Comment"]') ||
+              el.closest('[class*="Comment"]'));
+  }
+
+  // data-e2e names shift between layouts — browse-like-icon, like-icon,
+  // video-like-icon — so this matches the SHAPE of the name instead of a list
+  // of literals that would just be more guesses. It requires the name to END in
+  // "like"/"like-icon", which keeps out the count label ("browse-like-count")
+  // sitting right next to it.
+  const LIKE_E2E_RE = /(^|-)(un)?like(-icon)?$/i;
+
+  // Scoped to one root. Most specific strategy first.
+  function likeButtonIn(root) {
+    for (const sel of [
+      'span[data-e2e="browse-like-icon"]',   // desktop video viewer
+      'span[data-e2e="like-icon"]',          // feed layout
+    ]) {
+      const el = root.querySelector(sel);
+      if (el && !inComments(el)) return el.closest('button') || el;
+    }
+    // Shape-matched data-e2e, for a layout that renamed the hook.
+    for (const el of root.querySelectorAll('[data-e2e]')) {
+      const name = el.getAttribute('data-e2e') || '';
+      if (!LIKE_E2E_RE.test(name) || /comment/i.test(name)) continue;
+      if (inComments(el)) continue;
+      return el.closest('button') || el;
+    }
+    // aria-label fallback, last and most permissive.
+    for (const el of root.querySelectorAll('button[aria-label*="Like" i]')) {
+      if (!inComments(el)) return el;
+    }
+    return null;
   }
 
   // TikTok's DOM shifts often; try several strategies, most specific first.
   // No container => no button. There is deliberately NO document-wide fallback:
   // searching the whole page would let the script act on some other video (or
   // another page entirely) instead of failing safe into the 6-strike pause.
+  //
+  // Every candidate root is tried, innermost first, because the like button is
+  // not always inside the smallest one — see activeContainers().
   function findLikeButton() {
-    const root = activeContainer();
-    if (!root) return null;
-    for (const sel of [
-      'span[data-e2e="browse-like-icon"]',   // desktop video viewer
-      'span[data-e2e="like-icon"]',          // feed layout
-    ]) {
-      const el = root.querySelector(sel);
-      if (el) return el.closest('button') || el;
+    for (const root of activeContainers()) {
+      const btn = likeButtonIn(root);
+      if (btn) return btn;
     }
-    // aria-label fallback, HARDENED: the desktop comment drawer renders inside
-    // the same video container, and its per-comment like buttons also carry a
-    // "Like"-ish aria-label. A button inside anything comment-flavoured is
-    // rejected outright — better to miss and pause than to unlike a comment.
-    const el = root.querySelector('button[aria-label*="Like" i]');
-    if (el && !el.closest('[data-e2e*="comment"]')) return el;
     return null;
   }
 
@@ -505,9 +778,10 @@
   // cause is a non-English TikTok UI, which deserves its own message.
   let lastNextMiss = '';
 
-  function findNextButton() {
-    const scope = activeContainer();
-    if (!scope) { lastNextMiss = 'no-container'; return null; }
+  // Same widening as findLikeButton: the next/previous chevrons sit between the
+  // player and the comments column, outside the container that wraps just the
+  // video, so a single-root search never saw them either.
+  function nextButtonIn(scope) {
     // Most specific: TikTok's own hooks. Still deny-checked in case the hook
     // is reused on a control that does something else.
     for (const sel of [
@@ -515,7 +789,7 @@
       'button[data-e2e="browse-video-next"]',
     ]) {
       const el = scope.querySelector(sel);
-      if (el && !el.disabled && !vetoed(labelOf(el))) { lastNextMiss = ''; return el; }
+      if (el && !el.disabled && !vetoed(labelOf(el))) return { btn: el, labelled: 1 };
     }
     let labelled = 0;
     for (const b of scope.querySelectorAll('button')) {
@@ -524,7 +798,19 @@
       if (!label) continue;
       labelled++;
       if (vetoed(label)) continue;
-      if (NEXT_ALLOW_RE.test(label)) { lastNextMiss = ''; return b; }
+      if (NEXT_ALLOW_RE.test(label)) return { btn: b, labelled };
+    }
+    return { btn: null, labelled };
+  }
+
+  function findNextButton() {
+    const roots = activeContainers();
+    if (!roots.length) { lastNextMiss = 'no-container'; return null; }
+    let labelled = 0;
+    for (const scope of roots) {
+      const r = nextButtonIn(scope);
+      if (r.btn) { lastNextMiss = ''; return r.btn; }
+      labelled = Math.max(labelled, r.labelled);
     }
     lastNextMiss = labelled ? 'no-match' : 'no-labels';
     return null;
@@ -755,7 +1041,12 @@
     const guard = pageGuard();
     if (!guard.ok) {
       mode = 'idle';
-      log(`Not starting — ${guard.msg}`);
+      // The Liked grid is a near miss, not a wrong page: the run is armed and
+      // one click away. Saying "not on a profile page" there would send the
+      // user looking for a problem that does not exist.
+      log(guard.stage === 'profile'
+        ? 'Not starting — you are on your Liked grid. Open the first video from it, then press Start.'
+        : `Not starting — ${guard.msg}`);
       updateUI();
       return;
     }
@@ -1041,6 +1332,11 @@
         color: var(--ttmu-ac-pale); font-size: 11px;
         font-variant-numeric: tabular-nums;
       }
+      #ttmu-ready {
+        margin-top: 8px;
+        color: var(--ttmu-m7); font-size: 11px; line-height: 1.45;
+      }
+      #ttmu-ready.go { color: var(--ttmu-ac-pale); }
       @media (prefers-reduced-motion: reduce) {
         #ttmu-panel, #ttmu-panel * {
           animation: none !important;
@@ -1065,6 +1361,7 @@
       <input type="number" id="ttmu-target" min="0" step="10" placeholder="0">
     </div>
     <div id="ttmu-countdown" class="hidden"></div>
+    <div id="ttmu-ready" class="hidden"></div>
     <button id="ttmu-resume" class="hidden">Resume</button>
     <button id="ttmu-btn">Start</button>
     <div class="btnrow">
@@ -1241,6 +1538,16 @@
     el.classList.toggle('hidden', !text);
   }
 
+  // Same treatment for the readiness line: it is re-evaluated every couple of
+  // seconds, so it must never append to the log.
+  function setReady(text, go) {
+    const el = $('#ttmu-ready');
+    if (!el) return;
+    el.textContent = text || '';
+    el.classList.toggle('hidden', !text);
+    el.classList.toggle('go', !!go);
+  }
+
   function log(msg) {
     logHist.push(`${stamp()}  ${msg}`);
     while (logHist.length > CFG.logHistory) logHist.shift();
@@ -1293,20 +1600,112 @@
     return copyText(unlikedUrls.join('\n'), `Unliked list (${unlikedUrls.length} URLs)`);
   }
 
+  loadAnchor();
   updateUI();
 
-  {
+  // TikTok is a single-page app: walking from For You to your profile to the
+  // Liked tab to a video never reloads the script, so nothing would re-run the
+  // guard between page loads. The panel used to evaluate it exactly once, at
+  // injection, and then show that verdict forever. This slow poll keeps the
+  // readiness line honest AND is what arms the liked-feed anchor the moment the
+  // user's own Liked grid comes into view.
+  let readyTimer = 0;
+
+  function refreshReadiness() {
+    if (running) { setReady(''); return; }
     const g = pageGuard();
-    log(g.ok
-      ? 'Ready — this looks like your own Liked feed. Press Start.'
-      : `Not ready — ${g.msg}`);
+    if (g.ok) setReady('Ready — this is your own Liked feed. Press Start.', true);
+    else if (g.stage === 'profile') setReady(`Armed for @${ownHandleCache} — open a video from your Liked grid.`, true);
+    else setReady(`Not ready — ${g.msg}`);
+  }
+
+  function readinessTick() {
+    readyTimer = 0;
+    try { refreshReadiness(); } catch (e) { /* never let the poll die */ }
+    readyTimer = setTimeout(readinessTick, CFG.readyPollMs);
+  }
+  readinessTick();
+
+  // What the guard is actually looking at. When the panel refuses and the
+  // reason doesn't match what you see on screen, this says which selector
+  // produced which value — the difference between diagnosing and guessing.
+  function diagnose() {
+    const seen = (list) => list.filter((sel) => {
+      try { return !!visibleMatch([sel]); } catch (e) { return false; }
+    });
+    const rawHref = (() => {
+      for (const sel of ['a[data-e2e="nav-profile"]', '[data-e2e="profile-icon"] a[href^="/@"]']) {
+        const el = document.querySelector(sel);
+        if (el) return `${sel} -> ${el.getAttribute('href')}`;
+      }
+      return '(no signed-in profile link found)';
+    })();
+    const g = pageGuard();
+    const out = {
+      pathname: location.pathname,
+      pathKind: pathInfo().kind,
+      pathHandle: pathInfo().handle || '(not handle-shaped)',
+      ownHandle: ownHandle() || '(unknown)',
+      ownHandleFrom: ownHandleSource || '(nothing matched)',
+      ownHandleRawLink: rawHref,
+      likedTab: likedTabState(),
+      viewerKind: viewerKind(),
+      browseMarkers: seen(BROWSE_SELECTORS),
+      feedMarkers: seen(FEED_SELECTORS),
+      containerMarkers: seen(CONTAINER_SELECTORS),
+      anchor: anchor ? { handle: anchor.handle, ageMs: Date.now() - anchor.at } : null,
+      likeButton: !!findLikeButton(),
+      nextButton: !!findNextButton(),
+      guard: { ok: g.ok, stage: g.stage, msg: g.msg },
+      // Which roots are on screen and whether each actually contains the
+      // controls. A root that is present but yields nothing is the signature of
+      // a scoping bug rather than a missing button.
+      roots: activeContainers().map((el) => ({
+        e2e: el.getAttribute('data-e2e') || null,
+        id: el.getAttribute('id') || null,
+        cls: (el.getAttribute('class') || '').slice(0, 80) || null,
+        area: Math.round(visibleArea(el)),
+        hasLike: !!likeButtonIn(el),
+        hasNext: !!nextButtonIn(el).btn,
+      })),
+      // Every like-ish element on the page, in or out of scope. If findLikeButton
+      // is null but this list isn't, the selector is right and the SCOPE is wrong.
+      likeish: (() => {
+        const roots = activeContainers();
+        const seen = [];
+        const add = (el) => {
+          if (seen.some((s) => s.el === el)) return;
+          seen.push({
+            el,
+            tag: el.tagName,
+            e2e: el.getAttribute('data-e2e') || null,
+            aria: (el.getAttribute('aria-label') || '').slice(0, 60) || null,
+            pressed: el.getAttribute('aria-pressed'),
+            inComments: inComments(el),
+            inRoot: roots.findIndex((r) => r.contains(el)),
+          });
+        };
+        try {
+          for (const el of document.querySelectorAll('[data-e2e]')) {
+            if (/like/i.test(el.getAttribute('data-e2e') || '')) add(el);
+          }
+          for (const el of document.querySelectorAll('button[aria-label*="ike"]')) add(el);
+        } catch (e) { /* best effort */ }
+        return seen.slice(0, 20).map(({ el, ...rest }) => rest);
+      })(),
+    };
+    console.log('[TTMU] diagnostics\n' + JSON.stringify(out, null, 2));
+    return out;
   }
 
   // Debug / test hook.
   window.__TTMU__ = {
+    diagnose,
     CFG, P,
     start, stop, resume, pause, setDryRun, setTarget, resetCounters,
     findNextButton, findLikeButton, isLiked, pageGuard, ownHandle,
+    pathInfo, viewerKind, likedTabState, refreshReadiness,
+    anchor: () => (anchor ? { handle: anchor.handle, at: anchor.at } : null),
     copyLog, copyUnliked,
     unlikedUrls: () => unlikedUrls.slice(),
     get panel() { return panel; },
